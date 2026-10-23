@@ -1,0 +1,4 @@
+.build/
+.swiftpm/
+# The bundle install/build-app.sh produces.
+MacJanitor.app/
