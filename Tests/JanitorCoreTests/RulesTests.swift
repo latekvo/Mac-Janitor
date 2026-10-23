@@ -16,7 +16,6 @@ final class RulesTests: XCTestCase {
                        "merged (PR #7 merged), nothing left to push, untouched for 2.0 days")
         XCTAssertNil(WorktreeRules.removalReason(facts(idle: 0.5) { $0.mergedPR = 7 }, cfg))
         XCTAssertNil(WorktreeRules.removalReason(facts(idle: 2) { $0.mergedPR = 7; $0.dirty = true }, cfg))
-        // In main but with local commits beyond it is impossible; in main and pushed is the normal case.
         XCTAssertNotNil(WorktreeRules.removalReason(facts(idle: 2) { $0.mergedIntoMain = true; $0.headOnRemote = true }, cfg))
         XCTAssertNil(WorktreeRules.removalReason(facts(idle: 2) { $0.mergedIntoMain = true; $0.headOnRemote = false }, cfg))
     }

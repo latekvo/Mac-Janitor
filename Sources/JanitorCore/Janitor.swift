@@ -38,7 +38,16 @@ public enum Janitor {
         for c in worktrees { record(dryRun ? c.action : wt.execute(c)) }
         for a in scratch { record(dryRun ? a : ScratchpadJanitor.execute(a)) }
         for a in avds { record(dryRun ? a : AVDJanitor.execute(a, cfg)) }
-        for a in images { record(dryRun ? a : DockerJanitor.execute(a)) }
+        for a in images {
+            let done = dryRun ? a : DockerJanitor.execute(a)
+            // Docker Desktop's own containers (Kubernetes, kind) hold images
+            // without showing up in `docker ps -a`; Docker refusing is not a failure.
+            if done.status == .failed, let e = done.error, e.contains("is being used by") {
+                skips.append(Skip(category: .dockerImage, target: a.target, reason: "\(a.reason), but \(e)"))
+            } else {
+                record(done)
+            }
+        }
         if !dryRun && !worktrees.isEmpty {
             Shell.run(["git", "worktree", "prune"], cwd: cfg.argentRepo)
         }
