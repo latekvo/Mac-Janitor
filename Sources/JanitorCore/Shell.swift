@@ -5,6 +5,8 @@ public struct ShellResult: Sendable {
     public var stdout: String
     public var stderr: String
     public var ok: Bool { status == 0 }
+    /// `env` exits 127 when the command is not on `Shell.path`.
+    public var notFound: Bool { status == 127 }
 }
 
 public enum Shell {

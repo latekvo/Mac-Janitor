@@ -50,9 +50,21 @@ enum Format {
         x == x.rounded() ? String(Int(x)) : String(format: "%.1f", x)
     }
 
-    /// A path's last component, or a Docker image's first tag without its registry and id.
+    /// A node_modules by its worktree, a scratchpad by project and session, an image by
+    /// its first tag without registry, anything else by its last path component.
     static func name(_ target: String, _ category: JanitorCore.Category) -> String {
+        let parts = target.split(separator: "/").map(String.init)
         switch category {
+        case .nodeModules:
+            // ".../<repo>-worktrees/<worktree>/[<package path>/]node_modules"
+            let owner = parts.dropLast()
+            let start = (owner.lastIndex { $0.hasSuffix("-worktrees") }).map { $0 + 1 } ?? owner.count - 1
+            return owner[max(start, owner.startIndex)...].joined(separator: "/")
+        case .scratchpad:
+            // ".../<project path with / as ->/<session id>"
+            guard parts.count >= 2 else { return target }
+            let project = parts[parts.count - 2].split(separator: "-").last.map(String.init) ?? ""
+            return "\(project) · \(parts[parts.count - 1].prefix(8))"
         case .dockerImage:
             let parts = target.components(separatedBy: " (")
             let tags = parts[0]

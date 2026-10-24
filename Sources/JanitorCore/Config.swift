@@ -60,7 +60,8 @@ public struct Config: Codable, Equatable, Sendable {
         }
         let defaults = Config().dictionary
         if let unknown = overrides.keys.sorted().first(where: { defaults[$0] == nil }) {
-            throw JanitorError("\(url.path): unknown key \"\(unknown)\"; known: \(defaults.keys.sorted().joined(separator: ", "))")
+            let near = defaults.keys.min { distance($0, unknown) < distance($1, unknown) }!
+            throw JanitorError("\(url.path): unknown key \"\(unknown)\", did you mean \"\(near)\"?")
         }
         do {
             let merged = try JSONSerialization.data(withJSONObject: defaults.merging(overrides) { _, new in new })
@@ -81,6 +82,23 @@ public struct Config: Codable, Equatable, Sendable {
         }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
         try JSONSerialization.data(withJSONObject: diff, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]).write(to: url, options: .atomic)
+    }
+
+    /// Levenshtein distance.
+    static func distance(_ a: String, _ b: String) -> Int {
+        let a = Array(a), b = Array(b)
+        guard !a.isEmpty, !b.isEmpty else { return a.count + b.count }
+        var row = Array(0...b.count)
+        for i in 1...a.count {
+            var prev = row[0]
+            row[0] = i
+            for j in 1...b.count {
+                let cur = row[j]
+                row[j] = min(row[j] + 1, row[j - 1] + 1, prev + (a[i - 1] == b[j - 1] ? 0 : 1))
+                prev = cur
+            }
+        }
+        return row[b.count]
     }
 
     var dictionary: [String: Any] {

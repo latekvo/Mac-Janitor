@@ -13,8 +13,9 @@ enum DockerJanitor {
     /// own) has been seen referencing it for the threshold. Every run, preview or
     /// not, records what it sees in `Paths.dockerSeen`.
     static func plan(_ cfg: Config, now: Date, skips: inout [Skip], issues: inout [Issue]) -> [Action] {
-        guard Shell.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout: 20).ok else {
-            issues.append(Issue(.dockerImage, "Docker is not running"))
+        let info = Shell.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout: 20)
+        guard info.ok else {
+            if !info.notFound { issues.append(Issue(.dockerImage, "Docker is not running")) }
             return []
         }
         // `docker system df -v` also lists Docker Desktop's own containers (Kubernetes,

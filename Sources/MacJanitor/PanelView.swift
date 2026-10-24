@@ -165,12 +165,7 @@ private struct CategoryRow: View {
                         .rotationEffect(.degrees(expanded ? 90 : 0))
                 }
                 let issues = store.issues(category)
-                if enabled, !issues.isEmpty {
-                    Image(systemName: "exclamationmark.triangle.fill")
-                        .font(.caption)
-                        .foregroundStyle(.orange)
-                        .help(issues.joined(separator: "\n"))
-                }
+                if enabled, !issues.isEmpty { IssueBadge(issues: issues) }
                 Spacer(minLength: 4)
                 if enabled { SizeLabel(category: category) }
                 Toggle(category.title, isOn: Binding(get: { enabled }, set: { store.setEnabled(category, $0) }))
@@ -193,6 +188,26 @@ private struct CategoryRow: View {
             if expanded {
                 ItemList(items: items)
             }
+        }
+    }
+}
+
+/// Tooltips do not show in a menu-bar window, so the message opens on click.
+private struct IssueBadge: View {
+    let issues: [String]
+    @State private var shown = false
+
+    var body: some View {
+        Button { shown.toggle() } label: {
+            Image(systemName: "exclamationmark.triangle.fill").font(.caption).foregroundStyle(.orange)
+        }
+        .buttonStyle(.borderless)
+        .popover(isPresented: $shown, arrowEdge: .bottom) {
+            Text(issues.joined(separator: "\n"))
+                .font(.caption)
+                .fixedSize(horizontal: false, vertical: true)
+                .frame(width: 240, alignment: .leading)
+                .padding(10)
         }
     }
 }

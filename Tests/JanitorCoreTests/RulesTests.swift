@@ -106,7 +106,8 @@ final class RulesTests: XCTestCase {
         XCTAssertEqual(try Config.load(from: url), Config())
         for (json, message) in [
             (#"{"paused": true, "disabled": ["docker"]}"#, #"bad value for "disabled""#),
-            (#"{"paused": true, "Keep": ["/x"]}"#, #"unknown key "Keep""#),
+            (#"{"paused": true, "Keep": ["/x"]}"#, #"unknown key "Keep", did you mean "keep"?"#),
+            (#"{"pased": true}"#, #"unknown key "pased", did you mean "paused"?"#),
             (#"{"intervalHours": "12"}"#, #"wrong type for "intervalHours""#),
             ("{paused", "is not a JSON object"),
         ] {
@@ -159,5 +160,11 @@ final class RulesTests: XCTestCase {
         Janitor.pruneSalvage(c, now: Date()) { logged.append($0) }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir), ["new.patch"])
         XCTAssertEqual(logged, ["removed salvage \(dir)/old.patch"])
+    }
+
+    func testMissingToolIsToldApartFromAFailingOne() {
+        XCTAssertTrue(Shell.run(["janitor-no-such-tool"]).notFound)
+        XCTAssertFalse(Shell.run(["false"]).notFound)
+        XCTAssertFalse(Shell.run(["sh", "-c", "exit 2"]).notFound)
     }
 }

@@ -180,8 +180,8 @@ final class WorktreeJanitor {
                            "--json", "number,state,headRefName,headRefOid,isCrossRepository"],
                           cwd: repo, timeout: 180)
         guard r.ok, let prs = try? JSONDecoder().decode([PRInfo].self, from: Data(r.stdout.utf8)) else {
-            let why = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
-            issues.append(Issue(.worktree, "gh pr list failed in \(repo), PR rules skipped: \(why)"))
+            let why = r.notFound ? "gh is not installed" : r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            issues.append(Issue(.worktree, "Open-PR rule skipped for \(repo): \(why)"))
             return []
         }
         return prs

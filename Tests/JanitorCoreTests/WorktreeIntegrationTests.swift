@@ -168,7 +168,7 @@ final class WorktreeIntegrationTests: XCTestCase {
         let cfg = config()
         let janitor = WorktreeJanitor(cfg: cfg, guards: try Guards.gather())
         let plan = janitor.plan()
-        XCTAssertEqual(janitor.issues.map(\.message).filter { !$0.hasPrefix("gh pr list") }, [])
+        XCTAssertEqual(janitor.issues.map(\.message).filter { !$0.hasPrefix("Open-PR rule skipped") }, [])
 
         let whole = Set(plan.filter { $0.action.category == .worktree }.map(\.action.target))
         XCTAssertEqual(whole, [wts + "/merged", wts + "/old", wts + "/copy"])
