@@ -80,7 +80,7 @@ public struct Config: Codable, Equatable, Sendable {
             !(defaults[key].map { NSDictionary(dictionary: [key: $0]).isEqual(to: [key: value]) } ?? false)
         }
         try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
-        try JSONSerialization.data(withJSONObject: diff, options: [.prettyPrinted, .sortedKeys]).write(to: url, options: .atomic)
+        try JSONSerialization.data(withJSONObject: diff, options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]).write(to: url, options: .atomic)
     }
 
     var dictionary: [String: Any] {

@@ -242,8 +242,12 @@ final class Store: ObservableObject {
         if outcome.locked { return watchScheduledRun() }
         problem = outcome.problem
         guard var report = outcome.report else { return }
-        // Removed items go; ids the run did not act on were no longer planned.
+        // Removed items go and failures stay. Kept and guarded items were not part of
+        // the run, so they carry over from the preview.
+        let before = preview
         report.actions = report.actions.filter { $0.status == .failed }
+            + (before?.actions.filter { config.isKept($0.target) } ?? [])
+        report.skips = before?.skips ?? []
         preview = report
         previewedWith = config
     }
@@ -336,3 +340,4 @@ final class Store: ObservableObject {
         NSWorkspace.shared.open(Paths.log)
     }
 }
+

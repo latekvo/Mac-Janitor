@@ -112,11 +112,18 @@ struct ProblemBanner: View {
     let text: String
     let dismiss: () -> Void
 
+    static func shorten(_ s: String) -> String {
+        (s.hasPrefix("janitor: ") ? String(s.dropFirst(9)) : s)
+            .replacingOccurrences(of: Paths.support.path + "/", with: "")
+            .replacingOccurrences(of: Paths.home.path, with: "~")
+    }
+
     var body: some View {
         HStack(alignment: .firstTextBaseline, spacing: 6) {
             Image(systemName: "xmark.octagon.fill")
-            Text(text)
-                .lineLimit(2)
+            Text(Self.shorten(text))
+                .lineLimit(4)
+                .fixedSize(horizontal: false, vertical: true)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .help(text)
@@ -205,11 +212,11 @@ private struct SizeLabel: View {
                     .foregroundStyle(.tertiary)
                     .help("Nothing to clean")
             }
-        } else {
+        } else if store.busy == .previewing {
             RoundedRectangle(cornerRadius: 3)
                 .fill(.quaternary)
                 .frame(width: 38, height: 9)
-                .help(store.busy == .previewing ? "Checking..." : "Not checked yet")
+                .help("Checking...")
         }
     }
 }
@@ -353,8 +360,11 @@ private struct FooterView: View {
             if let run = store.lastRun {
                 Stat(symbol: "clock.arrow.circlepath", text: Format.ago(run.finishedAt))
                     .help("Last run \(Format.absolute(run.finishedAt))")
-                Stat(symbol: "arrow.down", text: Format.bytes(max(run.freeBytesAfter - run.freeBytesBefore, 0)))
-                    .help("Freed by the last run")
+                let removed = run.actions.filter { $0.status == .removed }.reduce(Int64(0)) { $0 + $1.bytes }
+                if removed > 0 {
+                    Stat(symbol: "arrow.down", text: Format.bytes(removed))
+                        .help("Removed by the last run")
+                }
             }
             if let next = store.nextRun {
                 let s = Format.span(next.timeIntervalSinceNow)
