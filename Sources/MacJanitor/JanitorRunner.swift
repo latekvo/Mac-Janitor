@@ -7,6 +7,8 @@ enum JanitorRunner {
         var report: Report?
         /// What to show the user when the run did not cleanly produce a report.
         var problem: String?
+        /// Another run, usually the scheduled one, held the lock.
+        var locked = false
     }
 
     /// `Contents/MacOS/janitor` inside the bundle; beside the binary under `.build` too.
@@ -14,18 +16,37 @@ enum JanitorRunner {
         Bundle.main.executableURL!.deletingLastPathComponent().appendingPathComponent("janitor")
     }
 
-    static func run(dryRun: Bool) async -> Outcome {
-        await Task.detached(priority: .userInitiated) { runBlocking(dryRun: dryRun) }.value
+    /// With `only`, a real run acts on just those action ids.
+    static func run(dryRun: Bool, only: [String]? = nil) async -> Outcome {
+        await Task.detached(priority: .userInitiated) { runBlocking(dryRun: dryRun, only: only) }.value
     }
 
-    private static func runBlocking(dryRun: Bool) -> Outcome {
+    private static func runBlocking(dryRun: Bool, only: [String]?) -> Outcome {
         let exe = executable
         guard FileManager.default.isExecutableFile(atPath: exe.path) else {
-            return Outcome(problem: "janitor not found at \(exe.path). Rebuild with install/build-app.sh.")
+            return Outcome(problem: "janitor not found at \(Format.path(exe.path))")
         }
+        var arguments = ["run", "--json"] + (dryRun ? ["--dry-run"] : [])
+        var onlyFile: URL?
+        defer { onlyFile.map { try? FileManager.default.removeItem(at: $0) } }
+        if let only {
+            let file = FileManager.default.temporaryDirectory
+                .appendingPathComponent("janitor-only-\(UUID().uuidString).txt")
+            do {
+                try only.joined(separator: "\n").write(to: file, atomically: true, encoding: .utf8)
+            } catch {
+                return Outcome(problem: "Could not write \(file.path): \(error.localizedDescription)")
+            }
+            onlyFile = file
+            arguments += ["--only", file.path]
+        }
+        return launch(exe, arguments)
+    }
+
+    private static func launch(_ exe: URL, _ arguments: [String]) -> Outcome {
         let process = Process()
         process.executableURL = exe
-        process.arguments = ["run", "--json"] + (dryRun ? ["--dry-run"] : [])
+        process.arguments = arguments
         process.standardInput = FileHandle.nullDevice
         let out = Pipe(), err = Pipe()
         process.standardOutput = out
@@ -52,18 +73,18 @@ enum JanitorRunner {
         let status = process.terminationStatus
 
         if process.terminationReason == .uncaughtSignal {
-            return Outcome(report: report, problem: "janitor was killed by signal \(status).")
+            return Outcome(report: report, problem: "janitor was killed by signal \(status)")
+        }
+        if status != 0 && stderr.hasSuffix("another janitor run is in progress") {
+            return Outcome(locked: true)
         }
         if status != 0 {
-            // The CLI exits 1 when any action failed; those rows already show in red.
-            let failed = report?.count(.failed) ?? 0
-            let problem = !stderr.isEmpty ? stderr
-                : failed > 0 ? "\(failed) action\(failed == 1 ? "" : "s") failed; see the list below."
-                : "janitor exited with status \(status)."
-            return Outcome(report: report, problem: problem)
+            // The CLI exits 1 when an action failed; those items already show in red.
+            if !stderr.isEmpty { return Outcome(report: report, problem: stderr) }
+            return Outcome(report: report, problem: report == nil ? "janitor exited with status \(status)" : nil)
         }
         if report == nil {
-            return Outcome(problem: "janitor printed no readable report." + (stderr.isEmpty ? "" : "\n" + stderr))
+            return Outcome(problem: "janitor printed no readable report" + (stderr.isEmpty ? "" : ": " + stderr))
         }
         return Outcome(report: report)
     }

@@ -1,27 +1,55 @@
 import AppKit
 import JanitorCore
-import ServiceManagement
 import SwiftUI
+
+enum Metrics {
+    static let width: CGFloat = 300
+    static let inset: CGFloat = 12
+    static let icon: CGFloat = 20
+    /// The trailing column: category toggles, item pins.
+    static let trailing: CGFloat = 30
+}
 
 struct PanelView: View {
     @EnvironmentObject private var store: Store
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 10) {
+        Group {
+            if store.showSettings {
+                SettingsView()
+            } else {
+                MainView()
+            }
+        }
+        .frame(width: Metrics.width)
+    }
+}
+
+private struct MainView: View {
+    @EnvironmentObject private var store: Store
+
+    var body: some View {
+        VStack(spacing: 0) {
             HeaderView()
+                .padding(.horizontal, Metrics.inset)
+                .padding(.top, Metrics.inset)
+                .padding(.bottom, 10)
             if let problem = store.problem {
                 ProblemBanner(text: problem) { store.problem = nil }
+                    .padding(.horizontal, Metrics.inset)
+                    .padding(.bottom, 8)
             }
-            Divider()
-            ReportSection()
-            if store.awaitingConfirmation, let preview = store.preview {
-                ConfirmBanner(preview: preview)
+            VStack(spacing: 0) {
+                ForEach(JanitorCore.Category.allCases, id: \.self) { CategoryRow(category: $0) }
             }
-            Divider()
-            ControlsView()
+            .padding(.horizontal, 6)
+            CleanButton()
+                .padding(.horizontal, Metrics.inset)
+                .padding(.top, 10)
+            FooterView()
+                .padding(.horizontal, Metrics.inset)
+                .padding(.vertical, 10)
         }
-        .padding(14)
-        .frame(width: 440)
     }
 }
 
@@ -31,315 +59,330 @@ private struct HeaderView: View {
     @EnvironmentObject private var store: Store
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(spacing: 6) {
-                Image(systemName: store.isLowDisk ? "externaldrive.badge.exclamationmark" : "internaldrive")
-                    .foregroundStyle(store.isLowDisk ? .red : .secondary)
-                Text("\(Format.bytes(store.freeBytes)) free")
-                    .font(.headline)
-                    .foregroundStyle(store.isLowDisk ? .red : .primary)
-                if store.isLowDisk {
-                    Text("below \(Format.bytes(Store.lowDiskBytes))")
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                }
-                Spacer()
-                if let busy = store.busy {
-                    ProgressView().controlSize(.small)
-                    Text(busy == .running ? "Cleaning up..." : "Previewing...")
-                        .font(.caption)
+        let free = Format.byteParts(store.freeBytes)
+        let tint: Color = store.isLowDisk ? .red : .primary
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                HStack(alignment: .firstTextBaseline, spacing: 0) {
+                    Text(free.number)
+                        .font(.system(size: 30, weight: .semibold, design: .rounded))
+                        .monospacedDigit()
+                    Text(" \(free.unit)")
+                        .font(.system(size: 15, weight: .medium, design: .rounded))
+                    Text("  free")
+                        .font(.subheadline)
                         .foregroundStyle(.secondary)
                 }
-            }
-            if let run = store.lastRun {
-                let delta = run.freeBytesAfter - run.freeBytesBefore
-                Text("Last run \(Format.relative(run.finishedAt))")
-                    .font(.callout)
-                    .help(Format.absolute(run.finishedAt))
-                Text((delta >= 0 ? "Freed \(Format.bytes(delta))" : "Free space fell \(Format.bytes(-delta))")
-                    + " on disk, \(Format.bytes(run.bytes(.removed))) measured across \(run.count(.removed)) removed")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
-                if run.count(.failed) > 0 {
-                    Text("\(run.count(.failed)) failed")
-                        .font(.caption)
-                        .foregroundStyle(.red)
+                .foregroundStyle(tint)
+                .help(store.isLowDisk ? "Below \(Format.number(store.config.lowDiskGB)) GB" : "")
+                Spacer()
+                // The clean button shows its own progress.
+                if store.busy != nil, store.busy != .cleaning {
+                    ProgressView().controlSize(.small)
                 }
-                ErrorList(errors: run.errors)
-            } else {
-                Text("No run recorded yet")
-                    .font(.callout)
-                    .foregroundStyle(.secondary)
+                Button { store.showSettings = true } label: {
+                    Image(systemName: "gearshape").font(.system(size: 14))
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Settings")
             }
+            CapacityBar(fraction: store.usedFraction, tint: store.isLowDisk ? .red : .accentColor)
+                .help("\(Format.bytes(store.totalBytes - store.freeBytes)) of \(Format.bytes(store.totalBytes)) used")
         }
     }
 }
 
-private struct ErrorList: View {
-    let errors: [String]
+private struct CapacityBar: View {
+    let fraction: Double
+    let tint: Color
 
     var body: some View {
-        ForEach(Array(errors.enumerated()), id: \.offset) { _, error in
-            Label(error, systemImage: "exclamationmark.triangle.fill")
-                .font(.caption)
-                .foregroundStyle(.red)
-                .textSelection(.enabled)
+        GeometryReader { geo in
+            ZStack(alignment: .leading) {
+                Capsule().fill(.quaternary)
+                Capsule().fill(tint).frame(width: geo.size.width * min(max(fraction, 0), 1))
+            }
         }
+        .frame(height: 5)
     }
 }
 
-private struct ProblemBanner: View {
+struct ProblemBanner: View {
     let text: String
     let dismiss: () -> Void
 
     var body: some View {
-        HStack(alignment: .top, spacing: 6) {
-            Image(systemName: "xmark.octagon.fill").foregroundStyle(.red)
+        HStack(alignment: .firstTextBaseline, spacing: 6) {
+            Image(systemName: "xmark.octagon.fill")
             Text(text)
-                .font(.caption)
+                .lineLimit(2)
                 .textSelection(.enabled)
                 .frame(maxWidth: .infinity, alignment: .leading)
-            Button(action: dismiss) { Image(systemName: "xmark") }
+                .help(text)
+            Button(action: dismiss) { Image(systemName: "xmark").font(.caption2.bold()) }
                 .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
         }
-        .padding(8)
+        .font(.caption)
+        .foregroundStyle(.red)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .background(Color.red.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
     }
 }
 
-// MARK: - Report list
+// MARK: - Categories
 
-private struct ReportSection: View {
+private struct CategoryRow: View {
     @EnvironmentObject private var store: Store
-    @State private var listHeight: CGFloat = 0
+    let category: JanitorCore.Category
+    @State private var hovering = false
 
     var body: some View {
-        let report = store.preview ?? store.lastRun
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                if store.preview != nil {
-                    Label("Preview - nothing deleted yet", systemImage: "eye")
-                        .font(.subheadline.bold())
+        let enabled = store.config.enabled(category)
+        let items = store.items(category)
+        let expanded = store.expanded == category && !items.isEmpty
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: category.symbol)
+                    .font(.system(size: 13))
+                    .frame(width: Metrics.icon)
+                    .foregroundStyle(enabled ? Color.accentColor : .secondary)
+                Text(category.title)
+                    .foregroundStyle(enabled ? .primary : .secondary)
+                if enabled, !items.isEmpty {
+                    Image(systemName: "chevron.right")
+                        .font(.system(size: 9, weight: .bold))
+                        .foregroundStyle(.tertiary)
+                        .rotationEffect(.degrees(expanded ? 90 : 0))
+                }
+                let issues = store.issues(category)
+                if enabled, !issues.isEmpty {
+                    Image(systemName: "exclamationmark.triangle.fill")
+                        .font(.caption)
                         .foregroundStyle(.orange)
-                    Spacer()
-                    Button("Show last run") { store.dismissPreview() }
-                        .buttonStyle(.link)
-                        .disabled(store.busy != nil)
-                } else {
-                    Text("Last run actions").font(.subheadline.bold())
+                        .help(issues.joined(separator: "\n"))
                 }
+                Spacer(minLength: 4)
+                if enabled { SizeLabel(category: category) }
+                Toggle(category.title, isOn: Binding(get: { enabled }, set: { store.setEnabled(category, $0) }))
+                    .toggleStyle(.switch)
+                    .controlSize(.mini)
+                    .labelsHidden()
+                    .frame(width: Metrics.trailing, alignment: .trailing)
+                    .help(enabled ? "Turn off" : "Turn on")
             }
-            if let report {
-                if store.preview != nil { ErrorList(errors: report.errors) }
-                // A ScrollView in a MenuBarExtra window collapses to almost nothing
-                // unless given a height, so it is sized to its content up to a cap.
-                ScrollView {
-                    ReportList(report: report)
-                        .background(GeometryReader { geo in
-                            Color.clear
-                                .onAppear { listHeight = geo.size.height }
-                                .onChange(of: geo.size.height) { listHeight = $0 }
-                        })
-                }
-                .frame(height: min(listHeight, 320))
+            .padding(.horizontal, 6)
+            .frame(height: 28)
+            .background(hovering && !items.isEmpty ? Color.primary.opacity(0.06) : .clear,
+                        in: RoundedRectangle(cornerRadius: 6))
+            .contentShape(Rectangle())
+            .onHover { hovering = $0 }
+            .onTapGesture {
+                guard !items.isEmpty else { return }
+                withAnimation(.easeOut(duration: 0.15)) { store.expanded = expanded ? nil : category }
+            }
+            if expanded {
+                ItemList(items: items)
+            }
+        }
+    }
+}
+
+private struct SizeLabel: View {
+    @EnvironmentObject private var store: Store
+    let category: JanitorCore.Category
+
+    var body: some View {
+        if store.covers(category) {
+            let bytes = store.plannedBytes(category)
+            if bytes > 0 {
+                Text(Format.bytes(bytes)).monospacedDigit()
             } else {
-                Text("Press Preview to see what would be cleaned up.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+                Image(systemName: "checkmark")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(.tertiary)
+                    .help("Nothing to clean")
             }
+        } else {
+            RoundedRectangle(cornerRadius: 3)
+                .fill(.quaternary)
+                .frame(width: 38, height: 9)
+                .help(store.busy == .previewing ? "Checking..." : "Not checked yet")
         }
     }
 }
 
-private struct ReportList: View {
-    let report: Report
-    @State private var showSkips = false
+private struct ItemList: View {
+    let items: [Item]
+    @State private var height: CGFloat = 0
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            if report.actions.isEmpty {
-                Text(report.dryRun ? "Nothing to clean up." : "Nothing was removed.")
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        // A ScrollView in a MenuBarExtra window collapses unless given a height.
+        ScrollView {
+            VStack(spacing: 0) {
+                ForEach(items) { ItemRow(item: $0) }
             }
-            ForEach(JanitorCore.Category.allCases, id: \.self) { category in
-                let actions = report.actions.filter { $0.category == category }
-                if !actions.isEmpty {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("\(category.title) (\(Format.bytes(actions.reduce(0) { $0 + $1.bytes })))")
-                            .font(.caption.bold())
-                            .foregroundStyle(.secondary)
-                        ForEach(actions) { ActionRow(action: $0) }
-                    }
-                }
-            }
-            if !report.skips.isEmpty {
-                DisclosureGroup("Skipped (\(report.skips.count))", isExpanded: $showSkips) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(report.skips) { SkipRow(skip: $0) }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .padding(.top, 4)
-                }
-                .font(.caption)
-            }
+            .background(GeometryReader { geo in
+                Color.clear
+                    .onAppear { height = geo.size.height }
+                    .onChange(of: geo.size.height) { height = $0 }
+            })
         }
-        .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(.trailing, 4)
+        .frame(height: min(height, 220))
+        .padding(.bottom, 4)
     }
 }
 
-private struct ActionRow: View {
-    let action: Action
+private struct ItemRow: View {
+    @EnvironmentObject private var store: Store
+    let item: Item
 
     var body: some View {
-        let failed = action.status == .failed
-        HStack(alignment: .firstTextBaseline, spacing: 6) {
-            Image(systemName: icon).foregroundStyle(failed ? .red : .secondary)
-            VStack(alignment: .leading, spacing: 1) {
-                Text(Format.path(action.target))
-                    .font(.callout)
-                    .lineLimit(1)
-                    .truncationMode(.middle)
-                    .help(action.target)
-                Text(action.reason)
-                    .font(.caption)
-                    .foregroundStyle(failed ? .red : .secondary)
-                if let error = action.error {
-                    Text(error)
-                        .font(.caption)
-                        .foregroundStyle(.red)
-                        .textSelection(.enabled)
-                }
-                if let salvage = action.salvage {
-                    Text("Salvaged to \(Format.path(salvage))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .textSelection(.enabled)
-                }
-            }
-            Spacer(minLength: 8)
-            VStack(alignment: .trailing, spacing: 1) {
-                Text(Format.bytes(action.bytes)).font(.callout).monospacedDigit()
-                Text(statusText).font(.caption).foregroundStyle(failed ? .red : .secondary)
-            }
-        }
-        .foregroundStyle(failed ? .red : .primary)
-    }
-
-    private var icon: String {
-        switch action.status {
-        case .planned: return "circle.dashed"
-        case .removed: return "checkmark.circle"
-        case .failed: return "xmark.circle.fill"
-        }
-    }
-
-    private var statusText: String {
-        switch action.status {
-        case .planned: return "will remove"
-        case .removed: return "removed"
-        case .failed: return "failed"
-        }
-    }
-}
-
-private struct SkipRow: View {
-    let skip: Skip
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 1) {
-            Text("\(skip.category.title): \(Format.path(skip.target))")
+        let hovering = store.hoveredItem == item.id
+        HStack(spacing: 8) {
+            Color.clear.frame(width: Metrics.icon, height: 1)
+            Text(item.name)
                 .lineLimit(1)
                 .truncationMode(.middle)
-                .help(skip.target)
-            Text(skip.reason).foregroundStyle(.secondary)
+                .foregroundStyle(nameStyle)
+            Spacer(minLength: 8)
+            if item.bytes > 0, item.kind != .guarded {
+                Text(Format.bytes(item.bytes))
+                    .monospacedDigit()
+                    .foregroundStyle(item.kind == .failed ? AnyShapeStyle(.red) : AnyShapeStyle(.secondary))
+            }
+            trailing(hovering: hovering)
+                .frame(width: Metrics.trailing)
+        }
+        .font(.callout)
+        .padding(.horizontal, 6)
+        .frame(height: 22)
+        .contentShape(Rectangle())
+        .help("\(Format.path(item.target))\n\(item.detail)")
+        .onHover { inside in
+            if inside {
+                store.hoveredItem = item.id
+            } else if store.hoveredItem == item.id {
+                store.hoveredItem = nil
+            }
+        }
+    }
+
+    private var nameStyle: AnyShapeStyle {
+        switch item.kind {
+        case .failed: return AnyShapeStyle(.red)
+        case .guarded, .pending: return AnyShapeStyle(.tertiary)
+        case .planned, .kept: return AnyShapeStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private func trailing(hovering: Bool) -> some View {
+        switch item.kind {
+        case .planned:
+            Button { store.pin(item.target) } label: { Image(systemName: "pin") }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Keep")
+                .opacity(hovering ? 1 : 0)
+        case .kept:
+            Button { store.unpin(item.target) } label: { Image(systemName: "pin.fill") }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.orange)
+                .help("Kept, click to unpin")
+        case .guarded:
+            Image(systemName: "lock.fill").foregroundStyle(.tertiary)
+        case .failed:
+            Image(systemName: "xmark.circle.fill").foregroundStyle(.red)
+        case .pending:
+            Image(systemName: "pin.slash").foregroundStyle(.tertiary)
+        }
+    }
+}
+
+// MARK: - Clean and footer
+
+private struct CleanButton: View {
+    @EnvironmentObject private var store: Store
+
+    var body: some View {
+        let total = store.planned.reduce(0) { $0 + $1.bytes }
+        Button { Task { await store.clean() } } label: {
+            HStack(spacing: 6) {
+                if store.busy == .cleaning {
+                    ProgressView().controlSize(.small).tint(.white)
+                    Text("Cleaning")
+                } else {
+                    Image(systemName: "sparkles")
+                    Text(total > 0 ? "Clean \(Format.bytes(total))" : "Clean").monospacedDigit()
+                }
+            }
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(ProminentButtonStyle(active: store.busy == .cleaning))
+        .disabled(store.busy != nil || store.planned.isEmpty)
+    }
+}
+
+/// Drawn by hand: AppKit's prominent bezel goes grey whenever the app is inactive.
+private struct ProminentButtonStyle: ButtonStyle {
+    /// Keeps the accent look while disabled, for work in progress.
+    var active = false
+    @Environment(\.isEnabled) private var isEnabled
+
+    func makeBody(configuration: Configuration) -> some View {
+        let lit = isEnabled || active
+        configuration.label
+            .font(.body.weight(.medium))
+            .foregroundStyle(lit ? AnyShapeStyle(.white) : AnyShapeStyle(.tertiary))
+            .frame(height: 32)
+            .background(lit ? AnyShapeStyle(Color.accentColor) : AnyShapeStyle(.quaternary),
+                        in: RoundedRectangle(cornerRadius: 8))
+            .overlay(RoundedRectangle(cornerRadius: 8).fill(.black.opacity(configuration.isPressed ? 0.15 : 0)))
+            .contentShape(RoundedRectangle(cornerRadius: 8))
+    }
+}
+
+private struct FooterView: View {
+    @EnvironmentObject private var store: Store
+
+    var body: some View {
+        HStack(spacing: 12) {
+            if let run = store.lastRun {
+                Stat(symbol: "clock.arrow.circlepath", text: Format.ago(run.finishedAt))
+                    .help("Last run \(Format.absolute(run.finishedAt))")
+                Stat(symbol: "arrow.down", text: Format.bytes(max(run.freeBytesAfter - run.freeBytesBefore, 0)))
+                    .help("Freed by the last run")
+            }
+            if let next = store.nextRun {
+                let s = Format.span(next.timeIntervalSinceNow)
+                Stat(symbol: "timer", text: s == "now" ? "soon" : "in \(s)")
+                    .help("Next run \(Format.absolute(next))")
+            } else {
+                Stat(symbol: "pause.circle", text: "paused")
+            }
+            Spacer()
+            Button { store.update { $0.paused.toggle() } } label: {
+                Image(systemName: store.config.paused ? "play.fill" : "pause.fill")
+            }
+            .buttonStyle(.borderless)
+            .help(store.config.paused ? "Resume scheduled runs" : "Pause scheduled runs")
         }
         .font(.caption)
+        .foregroundStyle(.secondary)
     }
 }
 
-private struct ConfirmBanner: View {
-    @EnvironmentObject private var store: Store
-    let preview: Report
+struct Stat: View {
+    let symbol: String
+    let text: String
 
     var body: some View {
-        let count = preview.count(.planned)
-        VStack(alignment: .leading, spacing: 6) {
-            Text(count == 0
-                 ? "The preview found nothing to remove. Run anyway?"
-                 : "Remove \(count) item\(count == 1 ? "" : "s") (\(Format.bytes(preview.bytes(.planned)))) listed above?")
-                .font(.callout.bold())
-            HStack {
-                Spacer()
-                Button("Cancel") { store.cancelRun() }
-                    .keyboardShortcut(.cancelAction)
-                Button(count == 0 ? "Run" : "Remove") { Task { await store.confirmRun() } }
-                    .keyboardShortcut(.defaultAction)
-            }
-        }
-        .padding(8)
-        .background(Color.orange.opacity(0.12), in: RoundedRectangle(cornerRadius: 6))
-    }
-}
-
-// MARK: - Controls
-
-private struct ControlsView: View {
-    @EnvironmentObject private var store: Store
-
-    var body: some View {
-        let busy = store.busy != nil
-        VStack(alignment: .leading, spacing: 8) {
-            HStack {
-                Button("Preview") { Task { await store.runPreview() } }
-                Button("Run now...") { Task { await store.requestRun() } }
-                Spacer()
-                Button("Open log") { store.openLog() }
-            }
-            .disabled(busy)
-
-            Toggle("Pause automatic runs", isOn: Binding(
-                get: { store.paused },
-                set: { store.setPaused($0) }
-            ))
-            .disabled(busy)
-
-            VStack(alignment: .leading, spacing: 2) {
-                Toggle("Launch at login", isOn: Binding(
-                    get: { store.loginStatus == .enabled || store.loginStatus == .requiresApproval },
-                    set: { store.setLaunchAtLogin($0) }
-                ))
-                .disabled(busy)
-                LoginStatusNote()
-            }
-
-            HStack {
-                Spacer()
-                Button("Quit") { NSApp.terminate(nil) }
-                    .disabled(busy)
-            }
-        }
-    }
-}
-
-private struct LoginStatusNote: View {
-    @EnvironmentObject private var store: Store
-
-    var body: some View {
-        if let problem = store.loginProblem {
-            Text(problem).font(.caption).foregroundStyle(.red).textSelection(.enabled)
-        }
-        switch store.loginStatus {
-        case .requiresApproval:
-            HStack(spacing: 4) {
-                Text("Needs approval in Login Items.").font(.caption).foregroundStyle(.orange)
-                Button("Open Settings") { SMAppService.openSystemSettingsLoginItems() }
-                    .buttonStyle(.link)
-                    .font(.caption)
-            }
-        default:
-            EmptyView()
+        HStack(spacing: 3) {
+            Image(systemName: symbol)
+            Text(text).monospacedDigit()
         }
     }
 }
