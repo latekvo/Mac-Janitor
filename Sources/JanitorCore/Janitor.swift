@@ -32,7 +32,14 @@ public enum Janitor {
                            log: (String) -> Void = { _ in }) throws -> Report {
         try FileManager.default.createDirectory(at: Paths.support, withIntermediateDirectories: true)
         let lockFD = open(lockPath, O_CREAT | O_RDWR, 0o644)
-        guard lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
+        // A few tries: `isRunning` probes hold the lock shared for an instant.
+        var locked = false
+        for _ in 0..<20 where lockFD >= 0 {
+            if flock(lockFD, LOCK_EX | LOCK_NB) == 0 { locked = true; break }
+            usleep(50_000)
+        }
+        guard locked else {
+            if lockFD >= 0 { close(lockFD) }
             throw JanitorError("another janitor run is in progress")
         }
         defer { close(lockFD) }
@@ -41,7 +48,7 @@ public enum Janitor {
         let freeBefore = freeDiskBytes()
         Safety.protectedPaths = (cfg.repos + cfg.repos.map(WorktreeJanitor.root) + [cfg.avdHome, cfg.scratchpadRoot])
             .map(FS.canonical)
-        let guards = Guards.gather()
+        let guards = try Guards.gather()
         var skips: [Skip] = []
         var issues: [Issue] = []
 
@@ -63,14 +70,25 @@ public enum Janitor {
             if let e = a.error { line += " [error: \(e)]" }
             log(line)
         }
-        for c in worktrees where wanted(c.action) { record(dryRun ? c.action : wt.execute(c)) }
-        for a in scratch where wanted(a) { record(dryRun ? a : ScratchpadJanitor.execute(a)) }
-        for a in avds where wanted(a) { record(dryRun ? a : AVDJanitor.execute(a, cfg)) }
+        // Planning can take minutes (fetch, gh); look again at what is in use right before deleting.
+        let fresh = dryRun ? guards : try Guards.gather()
+        func stillFree(_ a: Action, _ paths: String...) -> Bool {
+            guard let veto = paths.lazy.compactMap(fresh.veto).first else { return true }
+            skips.append(Skip(category: a.category, target: a.target, reason: "\(a.reason), but \(veto)"))
+            return false
+        }
+        for c in worktrees where wanted(c.action) && stillFree(c.action, c.action.target, c.checkout) {
+            record(dryRun ? c.action : wt.execute(c))
+        }
+        for a in scratch where wanted(a) && stillFree(a, a.target) { record(dryRun ? a : ScratchpadJanitor.execute(a)) }
+        for a in avds where wanted(a) && stillFree(a, AVDJanitor.avdDirectory(home: cfg.avdHome, name: a.target)) {
+            record(dryRun ? a : AVDJanitor.execute(a, cfg))
+        }
         for a in images where wanted(a) { record(dryRun ? a : DockerJanitor.execute(a)) }
         if !dryRun && worktrees.contains(where: { $0.action.category == .worktree }) {
             for repo in cfg.repos { Shell.run(["git", "worktree", "prune"], cwd: repo) }
         }
-        if !dryRun { pruneSalvage(cfg, now: started, log: log) }
+        if !dryRun && only == nil { pruneSalvage(cfg, now: started, log: log) }
         for s in skips { log("skip \(s.category.rawValue) \(s.target): \(s.reason)") }
         for i in issues { log("issue \(i.category.rawValue): \(i.message)") }
 

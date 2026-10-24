@@ -1,25 +1,17 @@
 import Foundation
 
-/// Parses Docker's RFC 3339 timestamps, whose nanosecond fractions ISO8601DateFormatter rejects.
-func parseDockerDate(_ s: String) -> Date? {
-    let trimmed = s.replacingOccurrences(of: #"\.\d+"#, with: "", options: .regularExpression)
-    let d = ISO8601DateFormatter().date(from: trimmed)
-    // The zero time marks "never" (e.g. an image that was never tagged locally).
-    return d.flatMap { $0.timeIntervalSince1970 < 0 ? nil : $0 }
-}
-
 enum DockerJanitor {
-    struct Image {
-        var id: String
-        var tags: String
-        var bytes: Int64
-        /// When it last arrived locally: pull, build or tag, else its creation.
-        var arrived: Date?
+    /// When each image was last seen in use, or first seen at all. Docker records
+    /// neither: a pulled image's dates are its upstream build time.
+    static func lastActive(previous: [String: Date], images: [String], inUse: Set<String>, now: Date) -> [String: Date] {
+        var next: [String: Date] = [:]
+        for id in images { next[id] = inUse.contains(id) ? now : previous[id] ?? now }
+        return next
     }
 
-    /// Docker keeps no last-used time, so an image counts as unused once no
-    /// container (running or stopped) references it and it arrived locally
-    /// longer ago than the threshold.
+    /// An image is unused once no container (running, stopped or Docker Desktop's
+    /// own) has been seen referencing it for the threshold. Every run, preview or
+    /// not, records what it sees in `Paths.dockerSeen`.
     static func plan(_ cfg: Config, now: Date, skips: inout [Skip], issues: inout [Issue]) -> [Action] {
         guard Shell.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout: 20).ok else {
             issues.append(Issue(.dockerImage, "Docker is not running"))
@@ -28,45 +20,38 @@ enum DockerJanitor {
         // `docker system df -v` also lists Docker Desktop's own containers (Kubernetes,
         // kind), which `docker ps -a` hides; it names their images by reference.
         let df = Shell.run(["docker", "system", "df", "-v", "--format",
-                            "{{range .Containers}}{{.Image}}|{{.Names}}\n{{end}}"], timeout: 60)
+                            "{{range .Containers}}{{.Image}}\n{{end}}"], timeout: 60)
         guard df.ok else {
             issues.append(Issue(.dockerImage, "docker system df failed: \(df.stderr)"))
             return []
         }
-        var usedBy: [String: String] = [:]
-        for line in lines(df.stdout) {
-            let parts = line.split(separator: "|", maxSplits: 1).map(String.init)
-            guard parts.count == 2 else { continue }
-            let id = Shell.run(["docker", "image", "inspect", "--format", "{{.Id}}", parts[0]]).stdout
+        var inUse = Set<String>()
+        for ref in Set(lines(df.stdout)) {
+            let id = Shell.run(["docker", "image", "inspect", "--format", "{{.Id}}", ref]).stdout
                 .trimmingCharacters(in: .whitespacesAndNewlines)
-            if !id.isEmpty { usedBy[id] = parts[1] }
+            if !id.isEmpty { inUse.insert(id) }
         }
         let imageIDs = Array(Set(lines(Shell.run(["docker", "image", "ls", "-q", "--no-trunc"]).stdout)))
+        let previous = (try? JSONDecoder.janitor.decode([String: Date].self, from: Data(contentsOf: Paths.dockerSeen))) ?? [:]
+        let active = lastActive(previous: previous, images: imageIDs, inUse: inUse, now: now)
+        try? JSONEncoder.janitor.encode(active).write(to: Paths.dockerSeen, options: .atomic)
         guard !imageIDs.isEmpty else { return [] }
-        let r = Shell.run(["docker", "image", "inspect", "--format",
-                           "{{.Id}}|{{.Size}}|{{.Metadata.LastTagTime}}|{{.Created}}|{{join .RepoTags \",\"}}"] + imageIDs)
+
+        let r = Shell.run(["docker", "image", "inspect", "--format", "{{.Id}}|{{.Size}}|{{join .RepoTags \",\"}}"] + imageIDs)
         var actions: [Action] = []
         for line in lines(r.stdout) {
             let p = line.split(separator: "|", omittingEmptySubsequences: false).map(String.init)
-            guard p.count == 5 else { continue }
-            let img = Image(id: p[0], tags: p[4].isEmpty ? "<none>" : p[4], bytes: Int64(p[1]) ?? 0,
-                            arrived: parseDockerDate(p[2]) ?? parseDockerDate(p[3]))
-            guard let arrived = img.arrived else { continue }
-            let age = now.timeIntervalSince(arrived) / 86400
-            guard age > cfg.dockerImageUnusedDays else { continue }
-            let target = "\(img.tags) (\(img.id.replacingOccurrences(of: "sha256:", with: "").prefix(12)))"
+            guard p.count == 3, let since = active[p[0]] else { continue }
+            let idle = now.timeIntervalSince(since) / 86400
+            guard idle > cfg.dockerImageUnusedDays else { continue }
+            let target = "\(p[2].isEmpty ? "<none>" : p[2]) (\(p[0].replacingOccurrences(of: "sha256:", with: "").prefix(12)))"
+            let bytes = Int64(p[1]) ?? 0
             if cfg.isKept(target) {
-                skips.append(Skip(category: .dockerImage, target: target, reason: "kept", kept: true, bytes: img.bytes))
-                continue
-            }
-            if let container = usedBy[img.id] {
-                skips.append(Skip(category: .dockerImage, target: target,
-                                  reason: "arrived \(Int(age)) days ago, but container \(container) uses it"))
+                skips.append(Skip(category: .dockerImage, target: target, reason: "kept", kept: true, bytes: bytes))
                 continue
             }
             actions.append(Action(category: .dockerImage, target: target,
-                                  reason: "no container uses it; arrived \(Int(age)) days ago",
-                                  bytes: img.bytes, status: .planned))
+                                  reason: "no container used it for \(Int(idle)) days", bytes: bytes, status: .planned))
         }
         return actions
     }
@@ -76,7 +61,7 @@ enum DockerJanitor {
         // The id sits in parentheses at the end of the target.
         let id = String(a.target.split(separator: "(").last!.dropLast())
         // -f so an image with several tags goes in one call; images used by a
-        // container never reach this point.
+        // container are never planned.
         let r = Shell.run(["docker", "rmi", "-f", id], timeout: 300)
         a.status = r.ok ? .removed : .failed
         if !r.ok { a.error = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines) }
@@ -174,11 +159,8 @@ enum ScratchpadJanitor {
         do {
             try FS.remove(a.target)
             a.status = .removed
-            // Drop the project folder once its last session is gone.
-            let project = (a.target as NSString).deletingLastPathComponent
-            if (try? FileManager.default.contentsOfDirectory(atPath: project))?.isEmpty == true {
-                try? FileManager.default.removeItem(atPath: project)
-            }
+            // Drop the project folder once its last session is gone; rmdir refuses a non-empty one.
+            rmdir((a.target as NSString).deletingLastPathComponent)
         } catch {
             a.status = .failed
             a.error = "\(error)"

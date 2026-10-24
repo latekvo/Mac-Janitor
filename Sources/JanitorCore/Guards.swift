@@ -6,9 +6,13 @@ public struct Guards {
     var openPaths: [String]
     var launchAgentStrings: [(plist: String, value: String)]
 
-    public static func gather() -> Guards {
+    public static func gather() throws -> Guards {
         // Every process of this user: cwd, executables, mapped and open files.
         let r = Shell.run(["lsof", "-n", "-Fn"], timeout: 60)
+        // lsof exits 1 over a single unreadable process; no output means no guard at all.
+        guard r.status == 0 || (r.status == 1 && !r.stdout.isEmpty) else {
+            throw JanitorError("lsof failed, so nothing in use can be told apart: \(r.stderr)")
+        }
         let open = r.stdout.split(separator: "\n").compactMap { line -> String? in
             line.hasPrefix("n/") ? String(line.dropFirst()) : nil
         }

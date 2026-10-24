@@ -23,7 +23,13 @@ guard args.first == "run", args.dropFirst().allSatisfy({ ["--dry-run", "--json",
 }
 let dryRun = args.contains("--dry-run")
 let json = args.contains("--json")
-let cfg = Config.load()
+let cfg: Config
+do {
+    cfg = try Config.load()
+} catch {
+    FileHandle.standardError.write(Data("janitor: \(error)\n".utf8))
+    exit(1)
+}
 
 let stamp = ISO8601DateFormatter()
 func logLine(_ s: String) {
@@ -32,6 +38,11 @@ func logLine(_ s: String) {
     // Dry runs come from people previewing; the log is the record of real runs.
     guard !dryRun else { return }
     try? FileManager.default.createDirectory(at: Paths.log.deletingLastPathComponent(), withIntermediateDirectories: true)
+    if let size = try? FileManager.default.attributesOfItem(atPath: Paths.log.path)[.size] as? Int, size > 5_000_000 {
+        let old = Paths.log.path + ".1"
+        try? FileManager.default.removeItem(atPath: old)
+        try? FileManager.default.moveItem(atPath: Paths.log.path, toPath: old)
+    }
     if let h = FileHandle(forWritingAtPath: Paths.log.path) {
         h.seekToEndOfFile()
         h.write(Data(line.utf8))

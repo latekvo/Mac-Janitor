@@ -124,6 +124,8 @@ public enum Paths {
     public static let history = support.appendingPathComponent("history.jsonl")
     public static let salvage = support.appendingPathComponent("salvage")
     public static let config = support.appendingPathComponent("config.json")
+    /// When each Docker image was last seen in use; see `DockerJanitor.lastActive`.
+    public static let dockerSeen = support.appendingPathComponent("docker-seen.json")
     public static let log = home.appendingPathComponent("Library/Logs/mac-janitor.log")
     public static let launchdLabel = "com.ignacy.mac-janitor"
 }

@@ -32,6 +32,7 @@ final class Store: ObservableObject {
     @Published private(set) var preview: Report?
     @Published private(set) var busy: Busy?
     @Published var problem: String?
+    private var configProblem: String?
     @Published private(set) var loginStatus: SMAppService.Status
     @Published var showSettings = false
     @Published var expanded: JanitorCore.Category?
@@ -65,8 +66,9 @@ final class Store: ObservableObject {
 
     static func live() -> Store {
         let (free, total) = Self.diskSpace()
-        let store = Store(config: Config.load(), freeBytes: free, totalBytes: total, lastRun: Report.load(),
+        let store = Store(config: Config(), freeBytes: free, totalBytes: total, lastRun: Report.load(),
                           loginStatus: SMAppService.mainApp.status, live: true)
+        store.reloadConfig()
         store.startObserving()
         return store
     }
@@ -180,7 +182,7 @@ final class Store: ObservableObject {
         guard live else { return }
         (freeBytes, totalBytes) = Self.diskSpace()
         lastRun = Report.load()
-        config = Config.load()
+        reloadConfig()
         loginStatus = SMAppService.mainApp.status
     }
 
@@ -248,7 +250,24 @@ final class Store: ObservableObject {
 
     // MARK: - Settings
 
+    /// A broken config.json stays broken until fixed by hand: saving over it would
+    /// drop whatever the user meant, and the CLI refuses to run on it meanwhile.
+    @discardableResult
+    private func reloadConfig() -> Bool {
+        do {
+            config = try Config.load()
+            if configProblem != nil, problem == configProblem { problem = nil }
+            configProblem = nil
+            return true
+        } catch {
+            configProblem = "\(error)"
+            problem = configProblem
+            return false
+        }
+    }
+
     func update(_ change: (inout Config) -> Void) {
+        guard !live || reloadConfig() else { return }
         var c = config
         change(&c)
         guard c != config else { return }
@@ -258,7 +277,7 @@ final class Store: ObservableObject {
         } catch {
             problem = "Could not save \(Format.path(Paths.config.path)): \(error.localizedDescription)"
         }
-        config = Config.load()
+        reloadConfig()
     }
 
     /// Applies config changes made in settings to the preview.
@@ -281,7 +300,10 @@ final class Store: ObservableObject {
 
     /// Removes every `keep` entry that protects `target`.
     func unpin(_ target: String) {
-        update { cfg in cfg.keep.removeAll { target == $0 || target.hasPrefix($0 + "/") } }
+        update { cfg in
+            let entries = cfg.keepEntries(for: target)
+            cfg.keep.removeAll { entries.contains($0) }
+        }
         if !showSettings, previewIsStale { Task { await runPreview() } }
     }
 

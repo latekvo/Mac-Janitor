@@ -98,7 +98,7 @@ final class WorktreeIntegrationTests: XCTestCase {
         var cfg = config()
         cfg.disabled = [.worktree]
         cfg.keep = [wts + "/pinned"]
-        let janitor = WorktreeJanitor(cfg: cfg, guards: Guards.gather())
+        let janitor = WorktreeJanitor(cfg: cfg, guards: try Guards.gather())
         let plan = janitor.plan()
 
         XCTAssertEqual(plan.map(\.action.target), [wts + "/donor/node_modules"])
@@ -117,9 +117,9 @@ final class WorktreeIntegrationTests: XCTestCase {
 
         // `only` narrows a run to the ids the caller saw; links it never saw still release donors.
         let id = "node_modules:\(wts)/donor/node_modules"
-        let narrowed = WorktreeJanitor(cfg: cfg, guards: Guards.gather(), only: [id]).plan()
+        let narrowed = WorktreeJanitor(cfg: cfg, guards: try Guards.gather(), only: [id]).plan()
         XCTAssertEqual(narrowed.map(\.action.id), [id])
-        XCTAssertEqual(WorktreeJanitor(cfg: cfg, guards: Guards.gather(), only: []).plan().count, 0)
+        XCTAssertEqual(WorktreeJanitor(cfg: cfg, guards: try Guards.gather(), only: []).plan().count, 0)
 
         // Removing node_modules must not make the worktree look recently used.
         XCTAssertEqual(plan.map(janitor.execute).map(\.status), [.removed])
@@ -166,7 +166,7 @@ final class WorktreeIntegrationTests: XCTestCase {
         defer { busyHandle.closeFile() }
 
         let cfg = config()
-        let janitor = WorktreeJanitor(cfg: cfg, guards: Guards.gather())
+        let janitor = WorktreeJanitor(cfg: cfg, guards: try Guards.gather())
         let plan = janitor.plan()
         XCTAssertEqual(janitor.issues.map(\.message).filter { !$0.hasPrefix("gh pr list") }, [])
 

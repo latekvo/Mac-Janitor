@@ -80,7 +80,7 @@ extension JanitorCore.Category {
         switch self {
         case .worktree: return "arrow.triangle.branch"
         case .nodeModules: return "shippingbox"
-        case .dockerImage: return "cube"
+        case .dockerImage: return "square.stack.3d.up"
         case .avd: return "iphone"
         case .scratchpad: return "note.text"
         }

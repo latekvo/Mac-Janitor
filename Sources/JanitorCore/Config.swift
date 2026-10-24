@@ -34,19 +34,43 @@ public struct Config: Codable, Equatable, Sendable {
 
     public func enabled(_ c: Category) -> Bool { !disabled.contains(c) }
 
-    public func isKept(_ target: String) -> Bool {
-        keep.contains { target == $0 || target.hasPrefix($0 + "/") }
+    /// The `keep` entries protecting `target`: the target itself, an ancestor, or for a
+    /// path, something inside it, since removing a folder removes its contents too.
+    public func keepEntries(for target: String) -> [String] {
+        // Docker targets end in " (<image id>)"; retagging must not end the keep.
+        func imageID(_ s: String) -> Substring? {
+            s.hasSuffix(")") ? s.range(of: " (", options: .backwards).map { s[$0.upperBound...] } : nil
+        }
+        return keep.filter { entry in
+            guard target.hasPrefix("/") else { return entry == target || (imageID(entry) != nil && imageID(entry) == imageID(target)) }
+            let k = FS.canonical(FS.normalize(entry))
+            return target == k || target.hasPrefix(k + "/") || k.hasPrefix(target + "/")
+        }
     }
 
-    public static func load(from url: URL = Paths.config) -> Config {
-        guard let data = try? Data(contentsOf: url),
-              let overrides = try? JSONSerialization.jsonObject(with: data) as? [String: Any]
-        else { return Config() }
-        let merged = Config().dictionary.merging(overrides) { _, new in new }
-        guard let mergedData = try? JSONSerialization.data(withJSONObject: merged),
-              let cfg = try? JSONDecoder().decode(Config.self, from: mergedData)
-        else { return Config() }
-        return cfg
+    public func isKept(_ target: String) -> Bool { !keepEntries(for: target).isEmpty }
+
+    /// Defaults when the file is missing. A file that is not valid JSON, has an unknown
+    /// key or a wrong value throws: guessing would unpause the job or drop the keep list.
+    public static func load(from url: URL = Paths.config) throws -> Config {
+        guard FileManager.default.fileExists(atPath: url.path) else { return Config() }
+        let data = try Data(contentsOf: url)
+        guard let overrides = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else {
+            throw JanitorError("\(url.path) is not a JSON object")
+        }
+        let defaults = Config().dictionary
+        if let unknown = overrides.keys.sorted().first(where: { defaults[$0] == nil }) {
+            throw JanitorError("\(url.path): unknown key \"\(unknown)\"; known: \(defaults.keys.sorted().joined(separator: ", "))")
+        }
+        do {
+            let merged = try JSONSerialization.data(withJSONObject: defaults.merging(overrides) { _, new in new })
+            return try JSONDecoder().decode(Config.self, from: merged)
+        } catch let DecodingError.dataCorrupted(ctx) {
+            let key = ctx.codingPath.first?.stringValue ?? "?"
+            throw JanitorError("\(url.path): bad value for \"\(key)\"; categories are \(Category.allCases.map(\.rawValue).joined(separator: ", "))")
+        } catch let DecodingError.typeMismatch(_, ctx) {
+            throw JanitorError("\(url.path): wrong type for \"\(ctx.codingPath.first?.stringValue ?? "?")\"")
+        }
     }
 
     /// Writes the keys that differ from the defaults, so later default changes still apply.

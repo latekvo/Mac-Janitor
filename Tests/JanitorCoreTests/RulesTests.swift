@@ -72,15 +72,18 @@ final class RulesTests: XCTestCase {
         XCTAssertEqual(FS.normalize("/private/var/a/./b/../c"), "/private/var/a/c")
     }
 
-    func testDockerDates() {
-        XCTAssertNil(parseDockerDate("0001-01-01T00:00:00Z"))
-        XCTAssertEqual(parseDockerDate("2026-10-01T12:00:00.123456789Z")?.timeIntervalSince1970, 1_790_856_000)
+    func testDockerImagesAgeFromLastSeenUse() {
+        let now = Date()
+        let earlier = now.addingTimeInterval(-10 * 86400)
+        let next = DockerJanitor.lastActive(previous: ["a": earlier, "b": earlier, "gone": earlier],
+                                            images: ["a", "b", "new"], inUse: ["b"], now: now)
+        XCTAssertEqual(next, ["a": earlier, "b": now, "new": now])
     }
 
     func testPartialConfigKeepsDefaults() throws {
         let url = FileManager.default.temporaryDirectory.appendingPathComponent("janitor-cfg-\(UUID()).json")
         try Data(#"{"paused": true, "openPRIdleDays": 5}"#.utf8).write(to: url)
-        let c = Config.load(from: url)
+        let c = try Config.load(from: url)
         XCTAssertTrue(c.paused)
         XCTAssertEqual(c.openPRIdleDays, 5)
         XCTAssertEqual(c.abandonedIdleDays, 30)
@@ -92,18 +95,40 @@ final class RulesTests: XCTestCase {
         let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
         XCTAssertEqual(saved.keys.sorted(), ["disabled", "openPRIdleDays"])
         XCTAssertEqual(saved["disabled"] as? [String], ["avd"])
-        XCTAssertEqual(Config.load(from: url), edited)
-        XCTAssertFalse(Config.load(from: url).enabled(.avd))
-        XCTAssertTrue(Config.load(from: url).enabled(.worktree))
+        XCTAssertEqual(try Config.load(from: url), edited)
+        XCTAssertFalse(try Config.load(from: url).enabled(.avd))
+        XCTAssertTrue(try Config.load(from: url).enabled(.worktree))
+    }
+
+    func testBrokenConfigThrowsInsteadOfFallingBackToDefaults() throws {
+        let url = FileManager.default.temporaryDirectory.appendingPathComponent("janitor-cfg-\(UUID()).json")
+        defer { try? FileManager.default.removeItem(at: url) }
+        XCTAssertEqual(try Config.load(from: url), Config())
+        for (json, message) in [
+            (#"{"paused": true, "disabled": ["docker"]}"#, #"bad value for "disabled""#),
+            (#"{"paused": true, "Keep": ["/x"]}"#, #"unknown key "Keep""#),
+            (#"{"intervalHours": "12"}"#, #"wrong type for "intervalHours""#),
+            ("{paused", "is not a JSON object"),
+        ] {
+            try Data(json.utf8).write(to: url)
+            XCTAssertThrowsError(try Config.load(from: url), json) { error in
+                XCTAssertTrue("\(error)".contains(message), "\(error)")
+            }
+        }
     }
 
     func testKeepMatchesTargetsAndTheirContents() {
         var c = Config()
-        c.keep = ["/a/wt", "img:latest (abc)"]
+        c.keep = ["/a/wt/", "img:latest (abc)", "/b/wt/node_modules"]
         XCTAssertTrue(c.isKept("/a/wt"))
         XCTAssertTrue(c.isKept("/a/wt/node_modules"))
         XCTAssertFalse(c.isKept("/a/wt2"))
         XCTAssertTrue(c.isKept("img:latest (abc)"))
+        XCTAssertTrue(c.isKept("img:v2,img:latest (abc)"))
+        XCTAssertFalse(c.isKept("img:latest (abd)"))
+        // Removing a folder removes what is kept inside it.
+        XCTAssertTrue(c.isKept("/b/wt"))
+        XCTAssertTrue(c.isKept("/b"))
     }
 
     func testScheduledRunsOnIntervalOrLowDisk() {

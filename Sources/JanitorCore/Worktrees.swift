@@ -1,3 +1,4 @@
+import CryptoKit
 import Foundation
 
 public struct PRInfo: Decodable, Sendable {
@@ -84,6 +85,8 @@ public enum WorktreeRules {
 struct Candidate {
     var action: Action
     var kind: Kind
+    /// The checkout the target is or sits in.
+    var checkout: String
 
     enum Kind: Equatable {
         case gitWorktree(repo: String, head: String)
@@ -94,13 +97,16 @@ struct Candidate {
     }
 }
 
-/// A symlink in a checkout's node_modules pointing outside the checkout, e.g. a
-/// worktree borrowing a donor checkout's packages instead of running `npm ci`.
-struct ForeignLink {
+/// A symlink that is a checkout's node_modules or one of its (@scope) entries.
+/// One pointing outside the checkout borrows a donor's packages instead of running `npm ci`.
+struct NodeLink {
     var checkout: String
     /// The node_modules directory or link the symlink is, or sits in.
     var nodeModules: String
+    var location: String
     var target: String
+
+    var foreign: Bool { !target.hasPrefix(checkout + "/") }
 }
 
 final class WorktreeJanitor {
@@ -120,6 +126,7 @@ final class WorktreeJanitor {
     /// Where a repo's worktrees live: `~/dev/x` -> `~/dev/x-worktrees`.
     static func root(_ repo: String) -> String { FS.normalize(repo) + "-worktrees" }
 
+    @discardableResult
     private func git(_ args: [String], cwd: String) -> ShellResult {
         Shell.run(["git", "--no-optional-locks"] + args, cwd: cwd)
     }
@@ -215,7 +222,8 @@ final class WorktreeJanitor {
 
     func addGitFacts(_ f: inout WorktreeFacts, _ e: Entry, repo: String, mainRef: String, prs: [PRInfo]) {
         guard let head = e.head else { return }
-        f.dirty = !git(["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all"], cwd: e.path)
+        // Untracked files count: work never added is still work.
+        f.dirty = !git(["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=all"], cwd: e.path)
             .stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let unpushed = git(["rev-list", "-n1", head, "--not", "--remotes"], cwd: repo)
         f.headOnRemote = unpushed.ok && unpushed.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
@@ -227,12 +235,12 @@ final class WorktreeJanitor {
         f.mergedPR = match.merged
     }
 
-    /// Links in `nodeModules` (itself, its entries and @scope entries) that leave `checkout`.
-    func foreignLinks(checkout: String, nodeModules nm: String) -> [ForeignLink] {
-        var links: [ForeignLink] = []
+    /// Symlinks among `nodeModules` itself, its entries and @scope entries.
+    func links(checkout: String, nodeModules nm: String) -> [NodeLink] {
+        var links: [NodeLink] = []
         func consider(_ path: String) {
-            guard FS.isSymlink(path), let t = FS.linkTarget(path), !t.hasPrefix(checkout + "/") else { return }
-            links.append(ForeignLink(checkout: checkout, nodeModules: nm, target: t))
+            guard FS.isSymlink(path), let t = FS.linkTarget(path) else { return }
+            links.append(NodeLink(checkout: checkout, nodeModules: nm, location: path, target: t))
         }
         consider(nm)
         guard FS.isDirectory(nm) else { return links }
@@ -248,8 +256,7 @@ final class WorktreeJanitor {
     }
 
     /// The checkouts of one repo, plus the foreign links of every checkout including the main one.
-    func scan(_ repo: String) -> (checkouts: [Checkout], links: [ForeignLink]) {
-        let repo = FS.canonical(repo)
+    func scan(_ repo: String) -> (checkouts: [Checkout], links: [NodeLink]) {
         guard git(["rev-parse", "--git-dir"], cwd: repo).ok else {
             issues.append(Issue(.worktree, "\(repo) is not a git repository"))
             return ([], [])
@@ -276,7 +283,7 @@ final class WorktreeJanitor {
         let nested = Set(paths.map(\.0))
 
         var checkouts: [Checkout] = []
-        var links: [ForeignLink] = []
+        var links: [NodeLink] = []
         for (path, entry) in paths {
             let tree = scanTree(path, nested: nested)
             // Measured before any git command, so our own reads cannot reset it.
@@ -289,17 +296,19 @@ final class WorktreeJanitor {
                 if let st = FS.lstatInfo(path + "/" + extra) { nmIdle = min(nmIdle, days(since: FS.mtime(st))) }
             }
             checkouts.append(Checkout(repo: repo, facts: f, entry: entry, nodeModules: tree.nodeModules, nodeModulesIdleDays: nmIdle))
-            links += tree.nodeModules.flatMap { foreignLinks(checkout: path, nodeModules: $0) }
+            links += tree.nodeModules.flatMap { self.links(checkout: path, nodeModules: $0) }
         }
-        links += scanTree(repo, nested: nested).nodeModules.flatMap { foreignLinks(checkout: repo, nodeModules: $0) }
+        links += scanTree(repo, nested: nested).nodeModules.flatMap { self.links(checkout: repo, nodeModules: $0) }
         return (checkouts, links)
     }
 
     func plan() -> [Candidate] {
         guard cfg.enabled(.worktree) || cfg.enabled(.nodeModules) else { return [] }
+        var repos: [String] = []
+        for r in cfg.repos.map({ FS.canonical(FS.normalize($0)) }) where !repos.contains(r) { repos.append(r) }
         var checkouts: [Checkout] = []
-        var links: [ForeignLink] = []
-        for repo in cfg.repos {
+        var links: [NodeLink] = []
+        for repo in repos {
             let s = scan(repo)
             checkouts += s.checkouts
             links += s.links
@@ -315,11 +324,10 @@ final class WorktreeJanitor {
                                       reason: "untouched for \(Int(f.idleDays)) days, but it is a git checkout of another repo"))
                 }
             } else if cfg.enabled(.worktree), let reason = WorktreeRules.removalReason(f, cfg) {
-                let kind: Candidate.Kind = c.entry?.head.map { .gitWorktree(repo: c.repo, head: $0) }
-                    ?? .plainDirectory
+                let kind: Candidate.Kind = c.entry?.head.map { .gitWorktree(repo: c.repo, head: $0) } ?? .plainDirectory
                 candidates.append(Candidate(
                     action: Action(category: .worktree, target: f.path, reason: reason, bytes: 0, status: .planned),
-                    kind: kind))
+                    kind: kind, checkout: f.path))
                 continue
             }
             guard cfg.enabled(.nodeModules), c.nodeModulesIdleDays > cfg.nodeModulesIdleDays else { continue }
@@ -328,41 +336,58 @@ final class WorktreeJanitor {
                     action: Action(category: .nodeModules, target: nm,
                                    reason: "worktree untouched for \(String(format: "%.1f", c.nodeModulesIdleDays)) days",
                                    bytes: 0, status: .planned),
-                    kind: FS.isSymlink(nm) ? .link : .plainDirectory))
+                    kind: FS.isSymlink(nm) ? .link : .plainDirectory, checkout: f.path))
             }
         }
 
         // Links do nothing themselves, so `only` (ids the caller saw) never lists them.
         var planned = candidates.map { $0.kind == .link || (only?.contains($0.action.id) ?? true) }
-        for i in candidates.indices where planned[i] {
+        func skip(_ i: Int, _ why: String, kept: Bool = false) {
+            planned[i] = false
             let a = candidates[i].action
-            let isLink = candidates[i].kind == .link
-            if cfg.isKept(a.target) {
-                planned[i] = false
-                if !isLink {
-                    skips.append(Skip(category: a.category, target: a.target, reason: "kept", kept: true,
-                                      bytes: FS.allocatedSize(a.target)))
-                }
-            } else if let veto = guards.veto(a.target) {
-                planned[i] = false
-                if !isLink { skips.append(Skip(category: a.category, target: a.target, reason: "\(a.reason), but \(veto)")) }
+            guard candidates[i].kind != .link else { return }
+            skips.append(Skip(category: a.category, target: a.target, reason: kept ? "kept" : "\(a.reason), but \(why)",
+                              kept: kept, bytes: kept ? FS.allocatedSize(a.target) : 0))
+        }
+        for i in candidates.indices where planned[i] {
+            let c = candidates[i]
+            if cfg.isKept(c.action.target) {
+                skip(i, "kept", kept: true)
+            } else if let veto = guards.veto(c.action.target) ?? guards.veto(c.checkout) {
+                // A process in the worktree (a dev server writes nothing) still needs its packages.
+                skip(i, veto)
+            } else if case .gitWorktree = c.kind, let lost = unsalvageable(c.action.target) {
+                skip(i, lost)
             }
         }
 
-        // A donor's packages must outlive every checkout still linking into them.
+        // A donor's packages must outlive every checkout still linking into them,
+        // including through links inside the donor (workspace packages), and a
+        // worktree must outlive the worktrees nested in it.
+        let allCheckouts = checkouts.map(\.facts.path) + repos
         var changed = true
         while changed {
             changed = false
             let gone = Set(candidates.indices.filter { planned[$0] }.map { candidates[$0].action.target })
-            let live = links.filter { !gone.contains($0.checkout) && !gone.contains($0.nodeModules) }
+            var reached: [String: String] = [:]
+            var frontier: [String] = []
+            for l in links where l.foreign && !gone.contains(l.checkout) && !gone.contains(l.nodeModules) {
+                if reached[l.target] == nil { reached[l.target] = l.checkout; frontier.append(l.target) }
+            }
+            while let r = frontier.popLast() {
+                for l in links where (l.location == r || l.location.hasPrefix(r + "/")) && reached[l.target] == nil {
+                    reached[l.target] = reached[r]
+                    frontier.append(l.target)
+                }
+            }
             for i in candidates.indices where planned[i] {
                 let t = candidates[i].action.target
-                guard let link = live.first(where: { $0.target == t || $0.target.hasPrefix(t + "/") }) else { continue }
-                planned[i] = false
-                changed = true
-                if candidates[i].kind != .link {
-                    skips.append(Skip(category: candidates[i].action.category, target: t,
-                                      reason: "\(candidates[i].action.reason), but \(link.checkout) links into it"))
+                if let (_, holder) = reached.first(where: { r, _ in r == t || r.hasPrefix(t + "/") || t.hasPrefix(r + "/") }) {
+                    skip(i, "\(holder) links into it")
+                    changed = true
+                } else if let inner = allCheckouts.first(where: { $0.hasPrefix(t + "/") && !gone.contains($0) }) {
+                    skip(i, "it contains the worktree \(inner)")
+                    changed = true
                 }
             }
         }
@@ -373,6 +398,22 @@ final class WorktreeJanitor {
             c.action.bytes = FS.allocatedSize(c.action.target)
             return c
         }
+    }
+
+    static let salvageCap: Int64 = 50_000_000
+
+    /// Untracked, non-ignored files: what salvage tars up.
+    func untracked(_ path: String) -> (files: [String], bytes: Int64) {
+        let files = git(["ls-files", "--others", "--exclude-standard", "-z"], cwd: path).stdout
+            .split(separator: "\0").map(String.init)
+        return (files, files.reduce(Int64(0)) { $0 + FS.allocatedSize(path + "/" + $1) })
+    }
+
+    /// Why removing this worktree would lose work salvage cannot keep, or nil.
+    func unsalvageable(_ path: String) -> String? {
+        let u = untracked(path)
+        guard u.bytes > Self.salvageCap else { return nil }
+        return "its \(u.files.count) untracked files (\(u.bytes / 1_000_000) MB) are too big to salvage"
     }
 
     func execute(_ c: Candidate) -> Action {
@@ -401,7 +442,9 @@ final class WorktreeJanitor {
     /// Keeps what removal would otherwise destroy: a ref for commits no branch
     /// or remote holds, and a patch plus tarball of uncommitted work.
     func salvage(_ path: String, head: String, repo: String) throws -> String? {
-        let name = (path as NSString).lastPathComponent
+        // The path hash keeps same-named worktrees of different folders apart.
+        let digest = SHA256.hash(data: Data(path.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
+        let name = (path as NSString).lastPathComponent + "-" + digest
         let stamp = ISO8601DateFormatter().string(from: now).replacingOccurrences(of: ":", with: "")
         var kept: [String] = []
 
@@ -414,28 +457,27 @@ final class WorktreeJanitor {
 
         let dir = cfg.salvageDir
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-        let diff = git(["diff", "HEAD", "--binary"], cwd: path)
+        // Written by git itself: the patch must survive non-UTF-8 content byte for byte.
+        let patch = "\(dir)/\(name)-\(stamp).patch"
+        let diff = git(["diff", "HEAD", "--binary", "--output=\(patch)"], cwd: path)
         guard diff.ok else { throw JanitorError("git diff failed in \(path): \(diff.stderr)") }
-        if !diff.stdout.isEmpty {
-            let patch = "\(dir)/\(name)-\(stamp).patch"
-            try diff.stdout.write(toFile: patch, atomically: true, encoding: .utf8)
+        if (FS.lstatInfo(patch)?.st_size ?? 0) > 0 {
             kept.append(patch)
+        } else {
+            try? FileManager.default.removeItem(atPath: patch)
         }
-        let untracked = git(["ls-files", "--others", "--exclude-standard", "-z"], cwd: path).stdout
-            .split(separator: "\0").map(String.init)
-        if !untracked.isEmpty {
-            let size = untracked.reduce(Int64(0)) { $0 + FS.allocatedSize(path + "/" + $1) }
-            if size <= 50_000_000 {
-                let list = "\(dir)/\(name)-\(stamp).untracked"
-                try untracked.joined(separator: "\n").write(toFile: list, atomically: true, encoding: .utf8)
-                let tgz = "\(dir)/\(name)-\(stamp)-untracked.tgz"
-                let tar = Shell.run(["tar", "-czf", tgz, "-T", list], cwd: path, timeout: 600)
-                try? FileManager.default.removeItem(atPath: list)
-                guard tar.ok else { throw JanitorError("tar of untracked files failed: \(tar.stderr)") }
-                kept.append(tgz)
-            } else {
-                kept.append("\(untracked.count) untracked files (\(size / 1_000_000) MB) not saved: over 50 MB")
+        let u = untracked(path)
+        if !u.files.isEmpty {
+            guard u.bytes <= Self.salvageCap else {
+                throw JanitorError("\(u.files.count) untracked files (\(u.bytes / 1_000_000) MB) are too big to salvage")
             }
+            let list = "\(dir)/\(name)-\(stamp).untracked"
+            try u.files.joined(separator: "\n").write(toFile: list, atomically: true, encoding: .utf8)
+            let tgz = "\(dir)/\(name)-\(stamp)-untracked.tgz"
+            let tar = Shell.run(["tar", "-czf", tgz, "-T", list], cwd: path, timeout: 600)
+            try? FileManager.default.removeItem(atPath: list)
+            guard tar.ok else { throw JanitorError("tar of untracked files failed: \(tar.stderr)") }
+            kept.append(tgz)
         }
         return kept.isEmpty ? nil : kept.joined(separator: ", ")
     }
