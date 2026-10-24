@@ -1,10 +1,9 @@
 import AppKit
 import SwiftUI
 
-@main
 struct MacJanitorApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var delegate
-    @StateObject private var store = Store()
+    @StateObject private var store = Store.live()
 
     var body: some Scene {
         MenuBarExtra {
