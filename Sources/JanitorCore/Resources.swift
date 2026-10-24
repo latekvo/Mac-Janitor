@@ -20,19 +20,26 @@ enum DockerJanitor {
     /// Docker keeps no last-used time, so an image counts as unused once no
     /// container (running or stopped) references it and it arrived locally
     /// longer ago than the threshold.
-    static func plan(_ cfg: Config, now: Date, skips: inout [Skip]) -> [Action] {
+    static func plan(_ cfg: Config, now: Date, skips: inout [Skip], issues: inout [Issue]) -> [Action] {
         guard Shell.run(["docker", "info", "--format", "{{.ServerVersion}}"], timeout: 20).ok else {
-            skips.append(Skip(category: .dockerImage, target: "docker", reason: "Docker daemon not running"))
+            issues.append(Issue(.dockerImage, "Docker is not running"))
             return []
         }
-        let containerIDs = lines(Shell.run(["docker", "ps", "-aq", "--no-trunc"]).stdout)
+        // `docker system df -v` also lists Docker Desktop's own containers (Kubernetes,
+        // kind), which `docker ps -a` hides; it names their images by reference.
+        let df = Shell.run(["docker", "system", "df", "-v", "--format",
+                            "{{range .Containers}}{{.Image}}|{{.Names}}\n{{end}}"], timeout: 60)
+        guard df.ok else {
+            issues.append(Issue(.dockerImage, "docker system df failed: \(df.stderr)"))
+            return []
+        }
         var usedBy: [String: String] = [:]
-        if !containerIDs.isEmpty {
-            let r = Shell.run(["docker", "inspect", "--format", "{{.Image}}|{{.Name}}"] + containerIDs)
-            for line in lines(r.stdout) {
-                let parts = line.split(separator: "|", maxSplits: 1).map(String.init)
-                if parts.count == 2 { usedBy[parts[0]] = parts[1] }
-            }
+        for line in lines(df.stdout) {
+            let parts = line.split(separator: "|", maxSplits: 1).map(String.init)
+            guard parts.count == 2 else { continue }
+            let id = Shell.run(["docker", "image", "inspect", "--format", "{{.Id}}", parts[0]]).stdout
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            if !id.isEmpty { usedBy[id] = parts[1] }
         }
         let imageIDs = Array(Set(lines(Shell.run(["docker", "image", "ls", "-q", "--no-trunc"]).stdout)))
         guard !imageIDs.isEmpty else { return [] }
@@ -48,6 +55,10 @@ enum DockerJanitor {
             let age = now.timeIntervalSince(arrived) / 86400
             guard age > cfg.dockerImageUnusedDays else { continue }
             let target = "\(img.tags) (\(img.id.replacingOccurrences(of: "sha256:", with: "").prefix(12)))"
+            if cfg.isKept(target) {
+                skips.append(Skip(category: .dockerImage, target: target, reason: "kept", kept: true, bytes: img.bytes))
+                continue
+            }
             if let container = usedBy[img.id] {
                 skips.append(Skip(category: .dockerImage, target: target,
                                   reason: "arrived \(Int(age)) days ago, but container \(container) uses it"))
@@ -86,6 +97,10 @@ enum AVDJanitor {
             let age = now.timeIntervalSince(newest) / 86400
             guard age > cfg.avdUnusedDays else { continue }
             let reason = "unused for \(String(format: "%.1f", age)) days"
+            if cfg.isKept(name) {
+                skips.append(Skip(category: .avd, target: name, reason: "kept", kept: true, bytes: FS.allocatedSize(dir)))
+                continue
+            }
             if running.contains("-avd \(name)") || running.contains("@\(name)") {
                 skips.append(Skip(category: .avd, target: name, reason: "\(reason), but its emulator is running"))
                 continue
@@ -138,6 +153,11 @@ enum ScratchpadJanitor {
                 let newest = FS.newestMTime(sdir, newerThan: cutoff) ?? .distantPast
                 guard newest <= cutoff else { continue }
                 let reason = "untouched for \(Int(now.timeIntervalSince(newest) / 86400)) days"
+                if cfg.isKept(sdir) {
+                    skips.append(Skip(category: .scratchpad, target: sdir, reason: "kept", kept: true,
+                                      bytes: FS.allocatedSize(sdir)))
+                    continue
+                }
                 if let veto = guards.veto(sdir) {
                     skips.append(Skip(category: .scratchpad, target: sdir, reason: "\(reason), but \(veto)"))
                     continue

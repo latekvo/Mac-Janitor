@@ -1,11 +1,37 @@
 import Foundation
 
 public enum Janitor {
-    /// Plans every rule and, unless `dryRun`, carries the plan out. Holds an
-    /// exclusive lock for the duration, so overlapping runs fail fast.
-    public static func run(_ cfg: Config, dryRun: Bool, log: (String) -> Void = { _ in }) throws -> Report {
+    static var lockPath: String { Paths.support.appendingPathComponent("run.lock").path }
+
+    /// True while some janitor process, scheduled or not, holds the run lock.
+    public static func isRunning() -> Bool {
+        let fd = open(lockPath, O_RDONLY)
+        guard fd >= 0 else { return false }
+        defer { close(fd) }
+        if flock(fd, LOCK_SH | LOCK_NB) == 0 {
+            flock(fd, LOCK_UN)
+            return false
+        }
+        return true
+    }
+
+    /// Why a scheduled run should not start now, or nil to run.
+    public static func scheduledSkipReason(_ cfg: Config, lastStart: Date?, freeBytes: Int64, now: Date = Date()) -> String? {
+        if cfg.paused { return "paused" }
+        let lowDisk = freeBytes > 0 && Double(freeBytes) < cfg.lowDiskGB * 1e9
+        if let lastStart, !lowDisk, now.timeIntervalSince(lastStart) < cfg.intervalHours * 3600 {
+            return "last run under \(cfg.intervalHours) h ago"
+        }
+        return nil
+    }
+
+    /// Plans every enabled rule and, unless `dryRun`, carries the plan out. With
+    /// `only`, a real run acts on just those action ids, if they are still planned.
+    /// Holds an exclusive lock for the duration, so overlapping runs fail fast.
+    public static func run(_ cfg: Config, dryRun: Bool, only: Set<String>? = nil,
+                           log: (String) -> Void = { _ in }) throws -> Report {
         try FileManager.default.createDirectory(at: Paths.support, withIntermediateDirectories: true)
-        let lockFD = open(Paths.support.appendingPathComponent("run.lock").path, O_CREAT | O_RDWR, 0o644)
+        let lockFD = open(lockPath, O_CREAT | O_RDWR, 0o644)
         guard lockFD >= 0, flock(lockFD, LOCK_EX | LOCK_NB) == 0 else {
             throw JanitorError("another janitor run is in progress")
         }
@@ -13,20 +39,22 @@ public enum Janitor {
 
         let started = Date()
         let freeBefore = freeDiskBytes()
-        Safety.protectedPaths = ([cfg.argentRepo, cfg.avdHome, cfg.scratchpadRoot] + cfg.worktreeRoots).map(FS.canonical)
+        Safety.protectedPaths = (cfg.repos + cfg.repos.map(WorktreeJanitor.root) + [cfg.avdHome, cfg.scratchpadRoot])
+            .map(FS.canonical)
         let guards = Guards.gather()
         var skips: [Skip] = []
-        var errors: [String] = []
-        var actions: [Action] = []
+        var issues: [Issue] = []
 
-        let wt = WorktreeJanitor(cfg: cfg, guards: guards)
+        let wt = WorktreeJanitor(cfg: cfg, guards: guards, only: only)
         let worktrees = wt.plan()
         skips += wt.skips
-        errors += wt.errors
-        let scratch = ScratchpadJanitor.plan(cfg, guards: guards, now: started, skips: &skips)
-        let avds = AVDJanitor.plan(cfg, guards: guards, now: started, skips: &skips)
-        let images = DockerJanitor.plan(cfg, now: started, skips: &skips)
+        issues += wt.issues
+        let scratch = cfg.enabled(.scratchpad) ? ScratchpadJanitor.plan(cfg, guards: guards, now: started, skips: &skips) : []
+        let avds = cfg.enabled(.avd) ? AVDJanitor.plan(cfg, guards: guards, now: started, skips: &skips) : []
+        let images = cfg.enabled(.dockerImage) ? DockerJanitor.plan(cfg, now: started, skips: &skips, issues: &issues) : []
 
+        var actions: [Action] = []
+        func wanted(_ a: Action) -> Bool { only?.contains(a.id) ?? true }
         func record(_ a: Action) {
             actions.append(a)
             let size = ByteCountFormatter.string(fromByteCount: a.bytes, countStyle: .file)
@@ -35,28 +63,19 @@ public enum Janitor {
             if let e = a.error { line += " [error: \(e)]" }
             log(line)
         }
-        for c in worktrees { record(dryRun ? c.action : wt.execute(c)) }
-        for a in scratch { record(dryRun ? a : ScratchpadJanitor.execute(a)) }
-        for a in avds { record(dryRun ? a : AVDJanitor.execute(a, cfg)) }
-        for a in images {
-            let done = dryRun ? a : DockerJanitor.execute(a)
-            // Docker Desktop's own containers (Kubernetes, kind) hold images
-            // without showing up in `docker ps -a`; Docker refusing is not a failure.
-            if done.status == .failed, let e = done.error, e.contains("is being used by") {
-                skips.append(Skip(category: .dockerImage, target: a.target, reason: "\(a.reason), but \(e)"))
-            } else {
-                record(done)
-            }
-        }
-        if !dryRun && !worktrees.isEmpty {
-            Shell.run(["git", "worktree", "prune"], cwd: cfg.argentRepo)
+        for c in worktrees where wanted(c.action) { record(dryRun ? c.action : wt.execute(c)) }
+        for a in scratch where wanted(a) { record(dryRun ? a : ScratchpadJanitor.execute(a)) }
+        for a in avds where wanted(a) { record(dryRun ? a : AVDJanitor.execute(a, cfg)) }
+        for a in images where wanted(a) { record(dryRun ? a : DockerJanitor.execute(a)) }
+        if !dryRun && worktrees.contains(where: { $0.action.category == .worktree }) {
+            for repo in cfg.repos { Shell.run(["git", "worktree", "prune"], cwd: repo) }
         }
         for s in skips { log("skip \(s.category.rawValue) \(s.target): \(s.reason)") }
-        for e in errors { log("error: \(e)") }
+        for i in issues { log("issue \(i.category.rawValue): \(i.message)") }
 
         let report = Report(startedAt: started, finishedAt: Date(), dryRun: dryRun,
                             freeBytesBefore: freeBefore, freeBytesAfter: freeDiskBytes(),
-                            actions: actions, skips: skips, errors: errors)
+                            actions: actions, skips: skips, issues: issues)
         if !dryRun { try persist(report) }
         return report
     }

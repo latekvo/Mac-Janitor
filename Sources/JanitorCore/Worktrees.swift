@@ -85,34 +85,43 @@ struct Candidate {
     var action: Action
     var kind: Kind
 
-    enum Kind {
-        case gitWorktree(head: String)
+    enum Kind: Equatable {
+        case gitWorktree(repo: String, head: String)
         case plainDirectory
+        /// A node_modules symlink. Removing it would free nothing, so it is never
+        /// removed or reported, but planning it releases the donor it points into.
+        case link
     }
 }
 
-/// A symlink in one checkout's node_modules pointing outside it, e.g. a worktree
-/// that borrows a donor checkout's packages instead of running `npm ci`.
+/// A symlink in a checkout's node_modules pointing outside the checkout, e.g. a
+/// worktree borrowing a donor checkout's packages instead of running `npm ci`.
 struct ForeignLink {
-    var holder: String
+    var checkout: String
+    /// The node_modules directory or link the symlink is, or sits in.
+    var nodeModules: String
     var target: String
 }
 
 final class WorktreeJanitor {
     let cfg: Config
     let guards: Guards
+    let only: Set<String>?
     let now = Date()
-    var errors: [String] = []
+    var issues: [Issue] = []
     var skips: [Skip] = []
-    private var mainRef = "origin/main"
 
-    init(cfg: Config, guards: Guards) {
+    init(cfg: Config, guards: Guards, only: Set<String>? = nil) {
         self.cfg = cfg
         self.guards = guards
+        self.only = only
     }
 
-    private func git(_ args: [String], cwd: String? = nil) -> ShellResult {
-        Shell.run(["git", "--no-optional-locks"] + args, cwd: cwd ?? cfg.argentRepo)
+    /// Where a repo's worktrees live: `~/dev/x` -> `~/dev/x-worktrees`.
+    static func root(_ repo: String) -> String { FS.normalize(repo) + "-worktrees" }
+
+    private func git(_ args: [String], cwd: String) -> ShellResult {
+        Shell.run(["git", "--no-optional-locks"] + args, cwd: cwd)
     }
 
     private func days(since date: Date?) -> Double {
@@ -127,10 +136,19 @@ final class WorktreeJanitor {
         var locked = false
     }
 
-    func registeredWorktrees() -> [Entry] {
-        let r = git(["worktree", "list", "--porcelain"])
+    struct Checkout {
+        var repo: String
+        var facts: WorktreeFacts
+        var entry: Entry?
+        var nodeModules: [String]
+        /// Days since the checkout or its installed packages last changed.
+        var nodeModulesIdleDays: Double
+    }
+
+    func registeredWorktrees(_ repo: String) -> [Entry] {
+        let r = git(["worktree", "list", "--porcelain"], cwd: repo)
         guard r.ok else {
-            errors.append("git worktree list failed: \(r.stderr)")
+            issues.append(Issue(.worktree, "git worktree list failed in \(repo): \(r.stderr)"))
             return []
         }
         var entries: [Entry] = []
@@ -150,22 +168,41 @@ final class WorktreeJanitor {
         return Array(entries.dropFirst())
     }
 
-    func fetchPRs() -> [PRInfo] {
+    func fetchPRs(_ repo: String) -> [PRInfo] {
         let r = Shell.run(["gh", "pr", "list", "--state", "all", "--limit", "5000",
                            "--json", "number,state,headRefName,headRefOid,isCrossRepository"],
-                          cwd: cfg.argentRepo, timeout: 180)
+                          cwd: repo, timeout: 180)
         guard r.ok, let prs = try? JSONDecoder().decode([PRInfo].self, from: Data(r.stdout.utf8)) else {
-            errors.append("gh pr list failed, PR-based worktree rules skipped: \(r.stderr.trimmingCharacters(in: .whitespacesAndNewlines))")
+            let why = r.stderr.trimmingCharacters(in: .whitespacesAndNewlines)
+            issues.append(Issue(.worktree, "gh pr list failed in \(repo), PR rules skipped: \(why)"))
             return []
         }
         return prs
     }
 
-    /// Idle time ignores node_modules (tests write caches there) but counts the
-    /// worktree's HEAD and index, which commits, checkouts and staging touch.
-    /// Not logs/HEAD: `git gc` rewrites every worktree's reflog at once.
-    func idleDays(_ path: String) -> Double {
-        var newest = FS.newestMTime(path, skipping: ["node_modules"]) ?? .distantPast
+    /// One walk of a checkout, not entering node_modules, `.git` or `nested` checkouts:
+    /// the newest file mtime and the node_modules directories or links.
+    /// Directory mtimes are ignored, since removing node_modules bumps them.
+    func scanTree(_ root: String, nested: Set<String>) -> (newest: Date?, nodeModules: [String]) {
+        var newest: Date?
+        var nodeModules: [String] = []
+        FS.walk(root) { path, name, st, _ in
+            let type = st.st_mode & S_IFMT
+            if type == S_IFDIR && (name == ".git" || nested.contains(path)) { return false }
+            if name == "node_modules" && (type == S_IFDIR || type == S_IFLNK) {
+                nodeModules.append(path)
+                return false
+            }
+            if type != S_IFDIR { newest = max(newest ?? .distantPast, FS.mtime(st)) }
+            return true
+        }
+        return (newest, nodeModules)
+    }
+
+    /// Idle time counts the worktree's git HEAD and index, which commits,
+    /// checkouts and staging touch. Not logs/HEAD: `git gc` rewrites every reflog at once.
+    func idleDays(_ path: String, newestFile: Date?) -> Double {
+        var newest = newestFile ?? FS.lstatInfo(path).map(FS.mtime) ?? .distantPast
         if let gitFile = try? String(contentsOfFile: path + "/.git", encoding: .utf8),
            gitFile.hasPrefix("gitdir: ") {
             let gitdir = gitFile.dropFirst(8).trimmingCharacters(in: .whitespacesAndNewlines)
@@ -176,45 +213,26 @@ final class WorktreeJanitor {
         return days(since: newest)
     }
 
-    func facts(_ e: Entry, prs: [PRInfo]) -> WorktreeFacts {
-        // Measured before any git command, so our own reads cannot reset it.
-        var f = WorktreeFacts(path: e.path, isGit: true, idleDays: idleDays(e.path))
-        f.locked = e.locked
-        guard let head = e.head else { return f }
+    func addGitFacts(_ f: inout WorktreeFacts, _ e: Entry, repo: String, mainRef: String, prs: [PRInfo]) {
+        guard let head = e.head else { return }
         f.dirty = !git(["status", "--porcelain", "--untracked-files=no", "--ignore-submodules=all"], cwd: e.path)
             .stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        let unpushed = git(["rev-list", "-n1", head, "--not", "--remotes"])
+        let unpushed = git(["rev-list", "-n1", head, "--not", "--remotes"], cwd: repo)
         f.headOnRemote = unpushed.ok && unpushed.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-        f.mergedIntoMain = git(["merge-base", "--is-ancestor", head, mainRef]).ok
+        f.mergedIntoMain = git(["merge-base", "--is-ancestor", head, mainRef], cwd: repo).ok
         let match = WorktreeRules.matchPRs(branch: e.branch, head: head, prs: prs) { oid in
-            self.git(["merge-base", "--is-ancestor", head, oid]).ok
+            self.git(["merge-base", "--is-ancestor", head, oid], cwd: repo).ok
         }
         f.openPR = match.open
         f.mergedPR = match.merged
-        return f
     }
 
-    /// node_modules directories (or links) inside a checkout, not descending into them.
-    func nodeModulesDirs(_ root: String) -> [String] {
-        var found: [String] = []
-        FS.walk(root) { path, name, st, _ in
-            if name == ".git" { return false }
-            if name == "node_modules" {
-                if st.st_mode & S_IFMT == S_IFDIR || st.st_mode & S_IFMT == S_IFLNK { found.append(path) }
-                return false
-            }
-            return true
-        }
-        return found
-    }
-
-    /// Links from a checkout's root node_modules (and its @scope dirs) that leave the checkout.
-    func foreignLinks(_ root: String) -> [ForeignLink] {
-        let nm = root + "/node_modules"
+    /// Links in `nodeModules` (itself, its entries and @scope entries) that leave `checkout`.
+    func foreignLinks(checkout: String, nodeModules nm: String) -> [ForeignLink] {
         var links: [ForeignLink] = []
         func consider(_ path: String) {
-            guard FS.isSymlink(path), let t = FS.linkTarget(path), !t.hasPrefix(root + "/") else { return }
-            links.append(ForeignLink(holder: root, target: t))
+            guard FS.isSymlink(path), let t = FS.linkTarget(path), !t.hasPrefix(checkout + "/") else { return }
+            links.append(ForeignLink(checkout: checkout, nodeModules: nm, target: t))
         }
         consider(nm)
         guard FS.isDirectory(nm) else { return links }
@@ -229,91 +247,130 @@ final class WorktreeJanitor {
         return links
     }
 
-    func plan() -> [Candidate] {
-        let fetch = Shell.run(["git", "fetch", "origin", "--prune", "--quiet"], cwd: cfg.argentRepo, timeout: 300)
-        if !fetch.ok { errors.append("git fetch failed, merge checks use stale refs: \(fetch.stderr)") }
-        let head = git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
-        if head.ok { mainRef = head.stdout.trimmingCharacters(in: .whitespacesAndNewlines) }
+    /// The checkouts of one repo, plus the foreign links of every checkout including the main one.
+    func scan(_ repo: String) -> (checkouts: [Checkout], links: [ForeignLink]) {
+        let repo = FS.canonical(repo)
+        guard git(["rev-parse", "--git-dir"], cwd: repo).ok else {
+            issues.append(Issue(.worktree, "\(repo) is not a git repository"))
+            return ([], [])
+        }
+        let wantWhole = cfg.enabled(.worktree)
+        var mainRef = "origin/main"
+        var prs: [PRInfo] = []
+        if wantWhole {
+            let fetch = Shell.run(["git", "fetch", "origin", "--prune", "--quiet"], cwd: repo, timeout: 300)
+            if !fetch.ok { issues.append(Issue(.worktree, "git fetch failed in \(repo), merge checks use stale refs: \(fetch.stderr)")) }
+            let head = git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd: repo)
+            if head.ok { mainRef = head.stdout.trimmingCharacters(in: .whitespacesAndNewlines) }
+            prs = fetchPRs(repo)
+        }
 
-        let registered = registeredWorktrees()
-        let registeredPaths = Set(registered.map(\.path))
-        let prs = fetchPRs()
-        let mainCheckout = FS.canonical(cfg.argentRepo)
+        let registered = registeredWorktrees(repo).filter { FS.isDirectory($0.path) }
+        var paths: [(String, Entry?)] = registered.map { ($0.path, $0) }
+        let known = Set(registered.map(\.path))
+        let root = FS.canonical(Self.root(repo))
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? [] {
+            let path = root + "/" + name
+            if FS.isDirectory(path) && !known.contains(path) { paths.append((path, nil)) }
+        }
+        let nested = Set(paths.map(\.0))
 
-        var checkouts: [(facts: WorktreeFacts, entry: Entry?)] = registered.map { ($0.path, $0) }
-            .filter { FS.isDirectory($0.0) }
-            .map { (facts($0.1, prs: prs), $0.1) }
-        for root in cfg.worktreeRoots.map(FS.canonical) {
-            for name in (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? [] {
-                let path = root + "/" + name
-                guard FS.isDirectory(path), !registeredPaths.contains(path) else { continue }
-                checkouts.append((WorktreeFacts(path: path, isGit: false, idleDays: idleDays(path)), nil))
+        var checkouts: [Checkout] = []
+        var links: [ForeignLink] = []
+        for (path, entry) in paths {
+            let tree = scanTree(path, nested: nested)
+            // Measured before any git command, so our own reads cannot reset it.
+            var f = WorktreeFacts(path: path, isGit: entry != nil, idleDays: idleDays(path, newestFile: tree.newest))
+            f.locked = entry?.locked ?? false
+            if let entry, wantWhole { addGitFacts(&f, entry, repo: repo, mainRef: mainRef, prs: prs) }
+            // Tests and installs write here, so they count as use for this rule.
+            var nmIdle = f.idleDays
+            for extra in ["node_modules", "node_modules/.cache", "node_modules/.vite", "node_modules/.package-lock.json"] {
+                if let st = FS.lstatInfo(path + "/" + extra) { nmIdle = min(nmIdle, days(since: FS.mtime(st))) }
             }
+            checkouts.append(Checkout(repo: repo, facts: f, entry: entry, nodeModules: tree.nodeModules, nodeModulesIdleDays: nmIdle))
+            links += tree.nodeModules.flatMap { foreignLinks(checkout: path, nodeModules: $0) }
+        }
+        links += scanTree(repo, nested: nested).nodeModules.flatMap { foreignLinks(checkout: repo, nodeModules: $0) }
+        return (checkouts, links)
+    }
+
+    func plan() -> [Candidate] {
+        guard cfg.enabled(.worktree) || cfg.enabled(.nodeModules) else { return [] }
+        var checkouts: [Checkout] = []
+        var links: [ForeignLink] = []
+        for repo in cfg.repos {
+            let s = scan(repo)
+            checkouts += s.checkouts
+            links += s.links
         }
 
         var candidates: [Candidate] = []
-        var removedWhole = Set<String>()
-        for (f, entry) in checkouts {
+        for c in checkouts {
+            let f = c.facts
             if !f.isGit && FS.exists(f.path + "/.git") {
                 // Some other repo's checkout: its unpushed work is invisible from here.
-                if f.idleDays > cfg.abandonedIdleDays {
+                if cfg.enabled(.worktree) && f.idleDays > cfg.abandonedIdleDays {
                     skips.append(Skip(category: .worktree, target: f.path,
-                                      reason: "untouched for \(Int(f.idleDays)) days, but it is a git checkout not registered with \(cfg.argentRepo)"))
+                                      reason: "untouched for \(Int(f.idleDays)) days, but it is a git checkout of another repo"))
                 }
-            } else if let reason = WorktreeRules.removalReason(f, cfg) {
-                let kind: Candidate.Kind = entry?.head.map { .gitWorktree(head: $0) } ?? .plainDirectory
+            } else if cfg.enabled(.worktree), let reason = WorktreeRules.removalReason(f, cfg) {
+                let kind: Candidate.Kind = c.entry?.head.map { .gitWorktree(repo: c.repo, head: $0) }
+                    ?? .plainDirectory
                 candidates.append(Candidate(
                     action: Action(category: .worktree, target: f.path, reason: reason, bytes: 0, status: .planned),
                     kind: kind))
-                removedWhole.insert(f.path)
                 continue
             }
-            // Tests and installs write here, so they count as use for this rule.
-            var idle = f.idleDays
-            for extra in ["node_modules", "node_modules/.cache", "node_modules/.vite", "node_modules/.package-lock.json"] {
-                if let st = FS.lstatInfo(f.path + "/" + extra) { idle = min(idle, days(since: FS.mtime(st))) }
-            }
-            guard idle > cfg.nodeModulesIdleDays else { continue }
-            for nm in nodeModulesDirs(f.path) {
+            guard cfg.enabled(.nodeModules), c.nodeModulesIdleDays > cfg.nodeModulesIdleDays else { continue }
+            for nm in c.nodeModules {
                 candidates.append(Candidate(
                     action: Action(category: .nodeModules, target: nm,
-                                   reason: "worktree untouched for \(String(format: "%.1f", idle)) days",
+                                   reason: "worktree untouched for \(String(format: "%.1f", c.nodeModulesIdleDays)) days",
                                    bytes: 0, status: .planned),
-                    kind: .plainDirectory))
+                    kind: FS.isSymlink(nm) ? .link : .plainDirectory))
+            }
+        }
+
+        // Links do nothing themselves, so `only` (ids the caller saw) never lists them.
+        var planned = candidates.map { $0.kind == .link || (only?.contains($0.action.id) ?? true) }
+        for i in candidates.indices where planned[i] {
+            let a = candidates[i].action
+            let isLink = candidates[i].kind == .link
+            if cfg.isKept(a.target) {
+                planned[i] = false
+                if !isLink {
+                    skips.append(Skip(category: a.category, target: a.target, reason: "kept", kept: true,
+                                      bytes: FS.allocatedSize(a.target)))
+                }
+            } else if let veto = guards.veto(a.target) {
+                planned[i] = false
+                if !isLink { skips.append(Skip(category: a.category, target: a.target, reason: "\(a.reason), but \(veto)")) }
             }
         }
 
         // A donor's packages must outlive every checkout still linking into them.
-        let allLinks = ([mainCheckout] + checkouts.map(\.facts.path)).flatMap(foreignLinks)
-        var planned = candidates.indices.map { _ in true }
         var changed = true
         while changed {
             changed = false
-            let nmGone = Set(candidates.indices.filter { planned[$0] && candidates[$0].action.category == .nodeModules }
-                .map { candidates[$0].action.target })
-            let wholeGone = Set(candidates.indices.filter { planned[$0] && candidates[$0].action.category == .worktree }
-                .map { candidates[$0].action.target })
-            let live = allLinks.filter { !wholeGone.contains($0.holder) && !nmGone.contains($0.holder + "/node_modules") }
+            let gone = Set(candidates.indices.filter { planned[$0] }.map { candidates[$0].action.target })
+            let live = links.filter { !gone.contains($0.checkout) && !gone.contains($0.nodeModules) }
             for i in candidates.indices where planned[i] {
                 let t = candidates[i].action.target
-                if let link = live.first(where: { ($0.target == t || $0.target.hasPrefix(t + "/")) }) {
-                    planned[i] = false
-                    changed = true
+                guard let link = live.first(where: { $0.target == t || $0.target.hasPrefix(t + "/") }) else { continue }
+                planned[i] = false
+                changed = true
+                if candidates[i].kind != .link {
                     skips.append(Skip(category: candidates[i].action.category, target: t,
-                                      reason: "\(candidates[i].action.reason), but \(link.holder) links into it"))
+                                      reason: "\(candidates[i].action.reason), but \(link.checkout) links into it"))
                 }
             }
         }
 
         return candidates.indices.compactMap { i -> Candidate? in
-            guard planned[i] else { return nil }
+            guard planned[i], candidates[i].kind != .link else { return nil }
             var c = candidates[i]
-            if let veto = guards.veto(c.action.target) {
-                skips.append(Skip(category: c.action.category, target: c.action.target, reason: "\(c.action.reason), but \(veto)"))
-                return nil
-            }
-            // A node_modules link frees nothing but the link itself.
-            c.action.bytes = FS.isSymlink(c.action.target) ? 0 : FS.allocatedSize(c.action.target)
+            c.action.bytes = FS.allocatedSize(c.action.target)
             return c
         }
     }
@@ -322,15 +379,15 @@ final class WorktreeJanitor {
         var a = c.action
         do {
             switch c.kind {
-            case .plainDirectory:
+            case .plainDirectory, .link:
                 try FS.remove(a.target)
-            case .gitWorktree(let head):
-                a.salvage = try salvage(a.target, head: head)
+            case .gitWorktree(let repo, let head):
+                a.salvage = try salvage(a.target, head: head, repo: repo)
                 try Safety.check(a.target)
-                let r = git(["worktree", "remove", "--force", "--force", a.target])
+                let r = git(["worktree", "remove", "--force", "--force", a.target], cwd: repo)
                 if !r.ok {
                     try FS.remove(a.target)
-                    git(["worktree", "prune"])
+                    git(["worktree", "prune"], cwd: repo)
                 }
             }
             a.status = .removed
@@ -343,15 +400,15 @@ final class WorktreeJanitor {
 
     /// Keeps what removal would otherwise destroy: a ref for commits no branch
     /// or remote holds, and a patch plus tarball of uncommitted work.
-    func salvage(_ path: String, head: String) throws -> String? {
+    func salvage(_ path: String, head: String, repo: String) throws -> String? {
         let name = (path as NSString).lastPathComponent
         let stamp = ISO8601DateFormatter().string(from: now).replacingOccurrences(of: ":", with: "")
         var kept: [String] = []
 
-        let held = git(["for-each-ref", "--count=1", "--contains", head, "refs/heads", "refs/remotes", "refs/janitor"])
+        let held = git(["for-each-ref", "--count=1", "--contains", head, "refs/heads", "refs/remotes", "refs/janitor"], cwd: repo)
         if held.ok && held.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let ref = "refs/janitor/\(name)-\(stamp)"
-            guard git(["update-ref", ref, head]).ok else { throw JanitorError("could not create \(ref)") }
+            guard git(["update-ref", ref, head], cwd: repo).ok else { throw JanitorError("could not create \(ref)") }
             kept.append(ref)
         }
 

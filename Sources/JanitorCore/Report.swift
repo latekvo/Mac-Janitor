@@ -40,17 +40,33 @@ public struct Action: Codable, Sendable, Identifiable {
     }
 }
 
-/// A candidate a rule matched but a guard protected.
+/// A candidate a rule matched but a guard or `Config.keep` protected.
 public struct Skip: Codable, Sendable, Identifiable {
     public var id: String { "\(category.rawValue):\(target)" }
     public var category: Category
     public var target: String
     public var reason: String
+    /// Protected by `Config.keep` rather than by a guard.
+    public var kept: Bool
+    public var bytes: Int64
 
-    public init(category: Category, target: String, reason: String) {
+    public init(category: Category, target: String, reason: String, kept: Bool = false, bytes: Int64 = 0) {
         self.category = category
         self.target = target
         self.reason = reason
+        self.kept = kept
+        self.bytes = bytes
+    }
+}
+
+/// A rule that could not run, wholly or partly, e.g. Docker not running.
+public struct Issue: Codable, Sendable, Hashable {
+    public var category: Category
+    public var message: String
+
+    public init(_ category: Category, _ message: String) {
+        self.category = category
+        self.message = message
     }
 }
 
@@ -62,11 +78,10 @@ public struct Report: Codable, Sendable {
     public var freeBytesAfter: Int64
     public var actions: [Action]
     public var skips: [Skip]
-    /// A whole category that could not run, e.g. Docker not running.
-    public var errors: [String]
+    public var issues: [Issue]
 
     public init(startedAt: Date, finishedAt: Date, dryRun: Bool, freeBytesBefore: Int64,
-                freeBytesAfter: Int64, actions: [Action], skips: [Skip], errors: [String]) {
+                freeBytesAfter: Int64, actions: [Action], skips: [Skip], issues: [Issue]) {
         self.startedAt = startedAt
         self.finishedAt = finishedAt
         self.dryRun = dryRun
@@ -74,7 +89,7 @@ public struct Report: Codable, Sendable {
         self.freeBytesAfter = freeBytesAfter
         self.actions = actions
         self.skips = skips
-        self.errors = errors
+        self.issues = issues
     }
 
     public static func load(from url: URL = Paths.lastRun) -> Report? {

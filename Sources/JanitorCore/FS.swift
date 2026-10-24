@@ -47,15 +47,13 @@ public enum FS {
         }
     }
 
-    /// Newest modification time of `root` and everything under it, ignoring
-    /// directories named in `skipping`. With `newerThan`, returns as soon as one
-    /// entry beats it, which is all a threshold check needs.
-    public static func newestMTime(_ root: String, skipping: Set<String> = [], newerThan cutoff: Date? = nil) -> Date? {
+    /// Newest modification time of `root` and everything under it. With
+    /// `newerThan`, returns as soon as one entry beats it, which is all a threshold check needs.
+    public static func newestMTime(_ root: String, newerThan cutoff: Date? = nil) -> Date? {
         guard let rootSt = lstatInfo(root) else { return nil }
         var newest = mtime(rootSt)
         if let cutoff, newest > cutoff { return newest }
-        walk(root) { _, name, st, stop in
-            if skipping.contains(name) && st.st_mode & S_IFMT == S_IFDIR { return false }
+        walk(root) { _, _, st, stop in
             let m = mtime(st)
             if m > newest { newest = m }
             if let cutoff, m > cutoff { stop = true }
