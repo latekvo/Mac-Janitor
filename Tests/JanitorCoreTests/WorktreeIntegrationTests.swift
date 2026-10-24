@@ -5,7 +5,7 @@ import XCTest
 final class WorktreeIntegrationTests: XCTestCase {
     var root = ""
     var repo: String { root + "/repo" }
-    var wts: String { root + "/wts" }
+    var wts: String { root + "/repo-worktrees" }
 
     @discardableResult
     func sh(_ args: [String], cwd: String? = nil) -> String {
@@ -55,7 +55,71 @@ final class WorktreeIntegrationTests: XCTestCase {
     }
 
     override func tearDownWithError() throws {
+        Safety.protectedPaths = []
         try? FileManager.default.removeItem(atPath: root)
+    }
+
+    func config() -> Config {
+        var cfg = Config()
+        cfg.repos = [repo]
+        cfg.salvageDir = root + "/salvage"
+        Safety.protectedPaths = [repo, wts, root]
+        return cfg
+    }
+
+    func link(_ path: String, to dest: String) throws {
+        try FileManager.default.createDirectory(atPath: (path as NSString).deletingLastPathComponent,
+                                                withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: path, withDestinationPath: dest)
+    }
+
+    func testDonorLinksKeepAndOnly() throws {
+        for name in ["donor", "donor2", "idleHolder", "activeHolder", "busyHolder", "pinned"] {
+            sh(["git", "worktree", "add", "-q", "--detach", wts + "/" + name])
+        }
+        try write(wts + "/donor/node_modules/a/index.js", "x")
+        try write(wts + "/donor/packages/p/node_modules/b/index.js", "x")
+        try write(wts + "/donor2/node_modules/@s/c/index.js", "x")
+        // An idle borrower: its node_modules is only a link, so it is not planned itself.
+        try link(wts + "/idleHolder/node_modules", to: wts + "/donor/node_modules")
+        // An active borrower of a package-level node_modules, not the root one.
+        try link(wts + "/activeHolder/packages/p/node_modules", to: wts + "/donor/packages/p/node_modules")
+        // An idle borrower whose own node_modules is in use, so it stays and keeps its link live.
+        try write(wts + "/busyHolder/node_modules/open.txt", "x")
+        try link(wts + "/busyHolder/node_modules/@s/c", to: wts + "/donor2/node_modules/@s/c")
+        try write(wts + "/pinned/node_modules/d/index.js", "x")
+        for name in ["donor", "donor2", "idleHolder", "busyHolder", "pinned"] { age(name, days: 5) }
+        let busy = try XCTUnwrap(FileHandle(forReadingAtPath: wts + "/busyHolder/node_modules/open.txt"))
+        defer { busy.closeFile() }
+
+        var cfg = config()
+        cfg.disabled = [.worktree]
+        cfg.keep = [wts + "/pinned"]
+        let janitor = WorktreeJanitor(cfg: cfg, guards: Guards.gather())
+        let plan = janitor.plan()
+
+        XCTAssertEqual(plan.map(\.action.target), [wts + "/donor/node_modules"])
+        XCTAssertTrue(plan.allSatisfy { $0.action.bytes > 0 })
+        let skips = Dictionary(uniqueKeysWithValues: janitor.skips.map { ($0.target, $0) })
+        XCTAssertEqual(Set(skips.keys), [wts + "/donor/packages/p/node_modules", wts + "/donor2/node_modules",
+                                         wts + "/busyHolder/node_modules", wts + "/pinned/node_modules"])
+        XCTAssertTrue(skips[wts + "/donor/packages/p/node_modules"]!.reason.hasSuffix("\(wts)/activeHolder links into it"))
+        XCTAssertTrue(skips[wts + "/donor2/node_modules"]!.reason.hasSuffix("\(wts)/busyHolder links into it"))
+        XCTAssertTrue(skips[wts + "/busyHolder/node_modules"]!.reason.contains("in use"))
+        XCTAssertEqual(skips[wts + "/pinned/node_modules"]!.kept, true)
+        XCTAssertGreaterThan(skips[wts + "/pinned/node_modules"]!.bytes, 0)
+        XCTAssertEqual(skips.values.filter(\.kept).count, 1)
+
+        // `only` narrows a run to the ids the caller saw; links it never saw still release donors.
+        let id = "node_modules:\(wts)/donor/node_modules"
+        let narrowed = WorktreeJanitor(cfg: cfg, guards: Guards.gather(), only: [id]).plan()
+        XCTAssertEqual(narrowed.map(\.action.id), [id])
+        XCTAssertEqual(WorktreeJanitor(cfg: cfg, guards: Guards.gather(), only: []).plan().count, 0)
+
+        // Removing node_modules must not make the worktree look recently used.
+        XCTAssertEqual(plan.map(janitor.execute).map(\.status), [.removed])
+        let tree = janitor.scanTree(wts + "/donor", nested: [])
+        XCTAssertGreaterThan(janitor.idleDays(wts + "/donor", newestFile: tree.newest), 4.9)
     }
 
     func testPlanGuardsAndExecution() throws {
@@ -95,15 +159,10 @@ final class WorktreeIntegrationTests: XCTestCase {
         let busyHandle = try XCTUnwrap(FileHandle(forReadingAtPath: wts + "/busy/a.txt"))
         defer { busyHandle.closeFile() }
 
-        var cfg = Config()
-        cfg.argentRepo = repo
-        cfg.worktreeRoots = [wts]
-        cfg.salvageDir = root + "/salvage"
-        Safety.protectedPaths = [repo, wts, root]
-        defer { Safety.protectedPaths = [] }
-
+        let cfg = config()
         let janitor = WorktreeJanitor(cfg: cfg, guards: Guards.gather())
         let plan = janitor.plan()
+        XCTAssertEqual(janitor.issues.map(\.message).filter { !$0.hasPrefix("gh pr list") }, [])
 
         let whole = Set(plan.filter { $0.action.category == .worktree }.map(\.action.target))
         XCTAssertEqual(whole, [wts + "/merged", wts + "/old", wts + "/copy"])
@@ -113,7 +172,7 @@ final class WorktreeIntegrationTests: XCTestCase {
         let skips = Dictionary(uniqueKeysWithValues: janitor.skips.map { ($0.target, $0.reason) })
         XCTAssertTrue(skips[wts + "/donor"]?.contains("\(wts)/active links into it") == true, "\(skips)")
         XCTAssertTrue(skips[wts + "/busy"]?.contains("in use") == true, "\(skips)")
-        XCTAssertTrue(skips[wts + "/foreign"]?.contains("not registered") == true, "\(skips)")
+        XCTAssertTrue(skips[wts + "/foreign"]?.contains("checkout of another repo") == true, "\(skips)")
         XCTAssertEqual(skips.count, 3, "\(skips)")
 
         let results = plan.map(janitor.execute)

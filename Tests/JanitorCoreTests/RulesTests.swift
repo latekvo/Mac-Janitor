@@ -84,8 +84,37 @@ final class RulesTests: XCTestCase {
         XCTAssertTrue(c.paused)
         XCTAssertEqual(c.openPRIdleDays, 5)
         XCTAssertEqual(c.abandonedIdleDays, 30)
-        try Config.setPaused(false, at: url)
-        XCTAssertFalse(Config.load(from: url).paused)
-        XCTAssertEqual(Config.load(from: url).openPRIdleDays, 5)
+        var edited = c
+        edited.paused = false
+        edited.disabled = [.avd]
+        try edited.save(to: url)
+        // Only what differs from the defaults is written, so later default changes still apply.
+        let saved = try JSONSerialization.jsonObject(with: Data(contentsOf: url)) as! [String: Any]
+        XCTAssertEqual(saved.keys.sorted(), ["disabled", "openPRIdleDays"])
+        XCTAssertEqual(saved["disabled"] as? [String], ["avd"])
+        XCTAssertEqual(Config.load(from: url), edited)
+        XCTAssertFalse(Config.load(from: url).enabled(.avd))
+        XCTAssertTrue(Config.load(from: url).enabled(.worktree))
+    }
+
+    func testKeepMatchesTargetsAndTheirContents() {
+        var c = Config()
+        c.keep = ["/a/wt", "img:latest (abc)"]
+        XCTAssertTrue(c.isKept("/a/wt"))
+        XCTAssertTrue(c.isKept("/a/wt/node_modules"))
+        XCTAssertFalse(c.isKept("/a/wt2"))
+        XCTAssertTrue(c.isKept("img:latest (abc)"))
+    }
+
+    func testScheduledRunsOnIntervalOrLowDisk() {
+        var c = Config()
+        let now = Date()
+        let hour: TimeInterval = 3600
+        XCTAssertNil(Janitor.scheduledSkipReason(c, lastStart: nil, freeBytes: 100_000_000_000, now: now))
+        XCTAssertNotNil(Janitor.scheduledSkipReason(c, lastStart: now - 5 * hour, freeBytes: 100_000_000_000, now: now))
+        XCTAssertNil(Janitor.scheduledSkipReason(c, lastStart: now - 6.1 * hour, freeBytes: 100_000_000_000, now: now))
+        XCTAssertNil(Janitor.scheduledSkipReason(c, lastStart: now - hour, freeBytes: 19_000_000_000, now: now))
+        c.paused = true
+        XCTAssertEqual(Janitor.scheduledSkipReason(c, lastStart: nil, freeBytes: 1, now: now), "paused")
     }
 }
