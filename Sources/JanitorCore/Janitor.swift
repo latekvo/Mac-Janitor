@@ -70,6 +70,7 @@ public enum Janitor {
         if !dryRun && worktrees.contains(where: { $0.action.category == .worktree }) {
             for repo in cfg.repos { Shell.run(["git", "worktree", "prune"], cwd: repo) }
         }
+        if !dryRun { pruneSalvage(cfg, now: started, log: log) }
         for s in skips { log("skip \(s.category.rawValue) \(s.target): \(s.reason)") }
         for i in issues { log("issue \(i.category.rawValue): \(i.message)") }
 
@@ -78,6 +79,16 @@ public enum Janitor {
                             actions: actions, skips: skips, issues: issues)
         if !dryRun { try persist(report) }
         return report
+    }
+
+    /// Salvaged work outlives its worktree by `abandonedIdleDays`, then goes too.
+    static func pruneSalvage(_ cfg: Config, now: Date, log: (String) -> Void) {
+        let cutoff = now.addingTimeInterval(-cfg.abandonedIdleDays * 86400)
+        for name in (try? FileManager.default.contentsOfDirectory(atPath: cfg.salvageDir)) ?? [] {
+            let path = cfg.salvageDir + "/" + name
+            guard let st = FS.lstatInfo(path), FS.mtime(st) < cutoff, (try? FS.remove(path)) != nil else { continue }
+            log("removed salvage \(path)")
+        }
     }
 
     static func persist(_ report: Report) throws {

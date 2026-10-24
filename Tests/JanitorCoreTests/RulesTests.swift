@@ -117,4 +117,22 @@ final class RulesTests: XCTestCase {
         c.paused = true
         XCTAssertEqual(Janitor.scheduledSkipReason(c, lastStart: nil, freeBytes: 1, now: now), "paused")
     }
+
+    func testSalvageOutlivesItsWorktreeByTheAbandonedThreshold() throws {
+        let dir = FS.canonical(FileManager.default.temporaryDirectory.path) + "/janitor-salvage-\(UUID())"
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        for (name, days) in [("old.patch", 31.0), ("new.patch", 29.0)] {
+            FileManager.default.createFile(atPath: dir + "/" + name, contents: Data())
+            let t = time_t(Date().addingTimeInterval(-days * 86400).timeIntervalSince1970)
+            var times = [timeval(tv_sec: t, tv_usec: 0), timeval(tv_sec: t, tv_usec: 0)]
+            utimes(dir + "/" + name, &times)
+        }
+        var c = Config()
+        c.salvageDir = dir
+        var logged: [String] = []
+        Janitor.pruneSalvage(c, now: Date()) { logged.append($0) }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: dir), ["new.patch"])
+        XCTAssertEqual(logged, ["removed salvage \(dir)/old.patch"])
+    }
 }

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Build MacJanitor.app, install the one LaunchAgent that runs the cleanup every
-# 6 hours, and start the applet. Re-runnable: it replaces any previous install.
+# Build MacJanitor.app, install the one LaunchAgent that runs the cleanup, and
+# start the applet. Re-runnable: it replaces any previous install.
 # Usage: ./install/install.sh     (undo: ./install/uninstall.sh)
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -25,8 +25,9 @@ cat > "$PLIST" <<PL
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key>
   <array><string>$JANITOR</string><string>run</string><string>--scheduled</string></array>
-  <!-- Missed intervals during sleep coalesce into one run on wake. -->
-  <key>StartInterval</key><integer>21600</integer>
+  <!-- Hourly wake; the janitor itself decides from config.json (intervalHours,
+       lowDiskGB, paused) whether to run. Wakes missed during sleep coalesce. -->
+  <key>StartInterval</key><integer>3600</integer>
   <key>ProcessType</key><string>Background</string>
   <key>LowPriorityIO</key><true/>
   <key>Nice</key><integer>10</integer>
@@ -39,6 +40,6 @@ PL
 
 launchctl bootout "$DOMAIN/$LABEL" 2>/dev/null || true
 launchctl bootstrap "$DOMAIN" "$PLIST"
-echo "Installed $PLIST (every 6 h). Run it now: launchctl kickstart $DOMAIN/$LABEL"
+echo "Installed $PLIST. Run it now: launchctl kickstart $DOMAIN/$LABEL"
 
 open "$ROOT/MacJanitor.app"
