@@ -74,7 +74,7 @@ final class WorktreeIntegrationTests: XCTestCase {
     }
 
     func testDonorLinksKeepAndOnly() throws {
-        for name in ["donor", "donor2", "idleHolder", "activeHolder", "busyHolder", "pinned"] {
+        for name in ["donor", "donor2", "donor3", "idleHolder", "activeHolder", "busyHolder", "pinned"] {
             sh(["git", "worktree", "add", "-q", "--detach", wts + "/" + name])
         }
         try write(wts + "/donor/node_modules/a/index.js", "x")
@@ -88,7 +88,10 @@ final class WorktreeIntegrationTests: XCTestCase {
         try write(wts + "/busyHolder/node_modules/open.txt", "x")
         try link(wts + "/busyHolder/node_modules/@s/c", to: wts + "/donor2/node_modules/@s/c")
         try write(wts + "/pinned/node_modules/d/index.js", "x")
-        for name in ["donor", "donor2", "idleHolder", "busyHolder", "pinned"] { age(name, days: 5) }
+        // The main checkout borrows too, and is never idle.
+        try write(wts + "/donor3/node_modules/e/index.js", "x")
+        try link(repo + "/node_modules", to: wts + "/donor3/node_modules")
+        for name in ["donor", "donor2", "donor3", "idleHolder", "busyHolder", "pinned"] { age(name, days: 5) }
         let busy = try XCTUnwrap(FileHandle(forReadingAtPath: wts + "/busyHolder/node_modules/open.txt"))
         defer { busy.closeFile() }
 
@@ -102,7 +105,9 @@ final class WorktreeIntegrationTests: XCTestCase {
         XCTAssertTrue(plan.allSatisfy { $0.action.bytes > 0 })
         let skips = Dictionary(uniqueKeysWithValues: janitor.skips.map { ($0.target, $0) })
         XCTAssertEqual(Set(skips.keys), [wts + "/donor/packages/p/node_modules", wts + "/donor2/node_modules",
-                                         wts + "/busyHolder/node_modules", wts + "/pinned/node_modules"])
+                                         wts + "/busyHolder/node_modules", wts + "/pinned/node_modules",
+                                         wts + "/donor3/node_modules"])
+        XCTAssertTrue(skips[wts + "/donor3/node_modules"]!.reason.hasSuffix("\(repo) links into it"))
         XCTAssertTrue(skips[wts + "/donor/packages/p/node_modules"]!.reason.hasSuffix("\(wts)/activeHolder links into it"))
         XCTAssertTrue(skips[wts + "/donor2/node_modules"]!.reason.hasSuffix("\(wts)/busyHolder links into it"))
         XCTAssertTrue(skips[wts + "/busyHolder/node_modules"]!.reason.contains("in use"))
@@ -118,6 +123,7 @@ final class WorktreeIntegrationTests: XCTestCase {
 
         // Removing node_modules must not make the worktree look recently used.
         XCTAssertEqual(plan.map(janitor.execute).map(\.status), [.removed])
+        XCTAssertTrue(FS.exists(wts + "/donor/packages/p/node_modules/b/index.js"))
         let tree = janitor.scanTree(wts + "/donor", nested: [])
         XCTAssertGreaterThan(janitor.idleDays(wts + "/donor", newestFile: tree.newest), 4.9)
     }
@@ -184,6 +190,9 @@ final class WorktreeIntegrationTests: XCTestCase {
         for kept in ["fresh", "donor/node_modules/pkg/index.js", "active", "stale/.git", "busy", "foreign"] {
             XCTAssertTrue(FS.exists(wts + "/" + kept), kept)
         }
+        // Removing stale/packages/p/node_modules bumped stale/packages/p; that is not use.
+        let stale = janitor.scanTree(wts + "/stale", nested: [])
+        XCTAssertGreaterThan(janitor.idleDays(wts + "/stale", newestFile: stale.newest), 4.9)
         let listed = sh(["git", "worktree", "list", "--porcelain"])
         XCTAssertFalse(listed.contains(wts + "/merged"))
         XCTAssertFalse(listed.contains(wts + "/old"))
