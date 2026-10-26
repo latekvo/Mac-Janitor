@@ -43,7 +43,8 @@ removing `node_modules` does not restart the clock.
 Before a git worktree goes (plain copies get no salvage), uncommitted changes are saved as a patch, untracked files
 up to 50 MB as a tarball, both in `~/Library/Application Support/MacJanitor/salvage/`
 for 30 days. A commit that no branch or remote holds gets a
-`refs/janitor/<name>-<time>` ref.
+`refs/janitor/<name>-<time>` ref. Ignored files (build output, but also `.env.local`
+or `.claude/settings.local.json`) are not kept.
 
 ## Layout
 

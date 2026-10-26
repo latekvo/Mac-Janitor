@@ -659,7 +659,8 @@ final class WorktreeJanitor {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // Written by git itself: the patch must survive non-UTF-8 content byte for byte.
         let patch = "\(dir)/\(name)-\(stamp).patch"
-        let diff = git(["diff", "HEAD", "--binary", "--output=\(patch)"], cwd: path)
+        // A diff.external tool or textconv driver would replace or garble the patch.
+        let diff = git(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary", "--output=\(patch)"], cwd: path)
         guard diff.ok else { throw JanitorError("git diff failed in \(path): \(diff.stderr)") }
         if (FS.lstatInfo(patch)?.st_size ?? 0) > 0 {
             kept.append(patch)

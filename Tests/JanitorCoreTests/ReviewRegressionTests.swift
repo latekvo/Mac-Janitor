@@ -456,6 +456,10 @@ final class ReviewRegressionTests: XCTestCase {
         let wt = repo + "-worktrees/w"
         addWT(repo, wt)
         try Data([0x6E, 0x61, 0xEF, 0x76, 0x65, 0x0A]).write(to: URL(fileURLWithPath: wt + "/l.txt"))
+        // Diff settings from the user's config must not shape the patch.
+        sh(["git", "config", "diff.external", "echo"], cwd: repo)
+        sh(["git", "config", "diff.upper.textconv", "tr a-z A-Z <"], cwd: repo)
+        try write(repo + "/.git/info/attributes", "*.txt diff=upper\n")
         age(repo, wt, days: 40)
         let c = cfg(protecting: [repo])
         let j = WorktreeJanitor(cfg: c, guards: try Guards.gather())
