@@ -384,7 +384,8 @@ final class ReviewRegressionTests: XCTestCase {
         // Submodule work no status shows: committed into the gitlink, or stashed.
         let commit = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q"]
         let bumped = sup + "-worktrees/bumped", stashed = sup + "-worktrees/stashed", hidden = sup + "-worktrees/hidden"
-        for p in [bumped, stashed, hidden] {
+        let behind = sup + "-worktrees/behind"
+        for p in [bumped, stashed, hidden, behind] {
             sh(["git", "worktree", "add", "-q", "--detach", p, "origin/main"], cwd: sup)
             sh(["git", "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"], cwd: p)
         }
@@ -395,7 +396,10 @@ final class ReviewRegressionTests: XCTestCase {
         sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "stash", "-q"], cwd: stashed + "/pkgs/s")
         sh(["git", "config", "status.showUntrackedFiles", "no"], cwd: hidden + "/pkgs/s")
         try write(hidden + "/pkgs/s/new.txt", "x")
-        for p in [bumped, stashed, hidden] { age(sup, p, days: 40) }
+        // A commit `submodule update` left behind: only the reflog holds it.
+        sh(commit + ["--allow-empty", "-m", "dropped"], cwd: behind + "/pkgs/s")
+        sh(["git", "-c", "protocol.file.allow=always", "submodule", "update", "-q"], cwd: behind)
+        for p in [bumped, stashed, hidden, behind] { age(sup, p, days: 40) }
         let broken = sup + "-worktrees/broken"
         addWT(sup, broken)
         try write(broken + "/.git", "garbage\n")
@@ -421,7 +425,7 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertTrue(reasons[away2]?.hasSuffix("but it contains the checkout \(away2)/linked") == true, "\(j.skips)")
         XCTAssertTrue(reasons[broken]?.contains("but git status failed") == true, "\(j.skips)")
         XCTAssertTrue(reasons[hidden]?.hasSuffix("but its submodule pkgs/s has work salvage cannot keep") == true, "\(j.skips)")
-        for p in [bumped, stashed] {
+        for p in [bumped, stashed, behind] {
             let dir = try XCTUnwrap(WorktreeJanitor.gitdir(of: p)) + "/modules/pkgs/s"
             XCTAssertTrue(reasons[p]?.hasSuffix("but its submodule repo \(dir) holds commits no remote has") == true, "\(p): \(j.skips)")
         }

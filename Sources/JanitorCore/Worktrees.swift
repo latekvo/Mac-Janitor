@@ -592,9 +592,9 @@ final class WorktreeJanitor {
             return String(f[8])
         }
         if let sub = busy.first { return "its submodule \(sub) has work salvage cannot keep" }
-        // Commits a branch, stash or the superproject's gitlink holds show in no status.
+        // Commits on a branch or stash, or left behind by `submodule update` (the reflog), show in no status.
         for dir in Self.gitdir(of: path).map(Self.submoduleGitDirs) ?? [] {
-            let r = Shell.run(["git", "--git-dir=\(dir)", "rev-list", "-n1", "--all", "--not", "--remotes"])
+            let r = Shell.run(["git", "--git-dir=\(dir)", "rev-list", "-n1", "--all", "--reflog", "--not", "--remotes"])
             if !r.ok || !r.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 return "its submodule repo \(dir) holds commits no remote has"
             }
