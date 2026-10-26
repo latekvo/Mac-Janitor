@@ -9,9 +9,8 @@ public struct Config: Codable, Equatable, Sendable {
     /// Below this much free space an automatic run starts without waiting for the interval.
     public var lowDiskGB = 20.0
     public var disabled: [Category] = []
-    /// Main checkouts. Their registered worktrees are in scope, and so is every
-    /// folder in `<repo>-worktrees`, git-registered or not.
-    public var repos = [Paths.home.appendingPathComponent("dev/engineering/argent").path]
+    /// Searched for repos with worktrees and for worktrees whose repo is gone.
+    public var worktreeSearchRoot = Paths.home.path
     /// Targets never removed; a path also keeps everything under it.
     public var keep: [String] = []
 

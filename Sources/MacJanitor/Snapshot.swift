@@ -128,7 +128,6 @@ enum Snapshot {
             ("d-low-disk", { Store(freeBytes: 12_400_000_000, totalBytes: total, lastRun: lastRun, preview: mixedPreview) }),
             ("e-settings", {
                 var cfg = Config()
-                cfg.repos.append("\(home)/dev/radon")
                 cfg.keep = ["\(worktrees)/map-crawler", "Pixel_9_API_36"]
                 cfg.nodeModulesIdleDays = 5
                 let s = Store(config: cfg, freeBytes: 124 * gb, totalBytes: total, lastRun: lastRun,

@@ -83,14 +83,12 @@ final class Store: ObservableObject {
                 if self.busy == nil, Janitor.isRunning() { self.watchScheduledRun() }
             }
         }
-        // The panel is this app's only window, key while it is open (NSOpenPanel aside).
+        // The panel is this app's only window, key while it is open.
         let center = NotificationCenter.default
-        observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { [weak self] note in
-            guard !(note.object is NSOpenPanel) else { return }
+        observers.append(center.addObserver(forName: NSWindow.didBecomeKeyNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.panelOpened() }
         })
-        observers.append(center.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] note in
-            guard !(note.object is NSOpenPanel) else { return }
+        observers.append(center.addObserver(forName: NSWindow.didResignKeyNotification, object: nil, queue: .main) { [weak self] _ in
             Task { @MainActor in self?.panelOpen = false }
         })
     }
@@ -309,17 +307,6 @@ final class Store: ObservableObject {
             cfg.keep.removeAll { entries.contains($0) }
         }
         if !showSettings, previewIsStale { Task { await runPreview() } }
-    }
-
-    func addRepo() {
-        let panel = NSOpenPanel()
-        panel.canChooseDirectories = true
-        panel.canChooseFiles = false
-        panel.allowsMultipleSelection = false
-        panel.prompt = "Add"
-        NSApp.activate(ignoringOtherApps: true)
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-        update { cfg in if !cfg.repos.contains(url.path) { cfg.repos.append(url.path) } }
     }
 
     func setLaunchAtLogin(_ on: Bool) {

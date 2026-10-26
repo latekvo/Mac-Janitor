@@ -46,13 +46,13 @@ public enum Janitor {
 
         let started = Date()
         let freeBefore = freeDiskBytes()
-        Safety.protectedPaths = (cfg.repos + cfg.repos.map(WorktreeJanitor.root) + [cfg.avdHome, cfg.scratchpadRoot])
-            .map(FS.canonical)
         let guards = try Guards.gather()
         var skips: [Skip] = []
         var issues: [Issue] = []
 
         let wt = WorktreeJanitor(cfg: cfg, guards: guards, only: only)
+        Safety.protectedPaths = (wt.repos + wt.repos.map(WorktreeJanitor.root) + [cfg.avdHome, cfg.scratchpadRoot])
+            .map(FS.canonical)
         let worktrees = wt.plan()
         skips += wt.skips
         issues += wt.issues
@@ -86,7 +86,7 @@ public enum Janitor {
         }
         for a in images where wanted(a) { record(dryRun ? a : DockerJanitor.execute(a)) }
         if !dryRun && worktrees.contains(where: { $0.action.category == .worktree }) {
-            for repo in cfg.repos { Shell.run(["git", "worktree", "prune"], cwd: repo) }
+            for repo in wt.repos { Shell.run(["git", "worktree", "prune"], cwd: repo) }
         }
         if !dryRun && only == nil { pruneSalvage(cfg, now: started, log: log) }
         for s in skips { log("skip \(s.category.rawValue) \(s.target): \(s.reason)") }

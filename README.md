@@ -15,9 +15,11 @@ the settings.
 | Android emulators (AVDs) | unused for 7 days |
 | Claude Code scratchpads (`/private/tmp/claude-<uid>/<project>/<session>`) | untouched for 14 days |
 
-Worktrees are those registered with each configured repo (default
-`~/dev/engineering/argent`), plus plain copies in `<repo>-worktrees`. The main
-checkout and branches are never removed.
+Worktrees are found by walking the home folder, skipping other volumes, `~/Library`,
+the Trash and `node_modules`: those registered with any repo there, plus plain copies in
+`<repo>-worktrees`. A worktree whose repo is gone (its `.git` file points nowhere)
+counts as a plain copy, which only the 30-day rule removes. The PR rules need a
+GitHub remote. The main checkout and branches are never removed.
 
 "Untouched" is the newest file modification time in the worktree, ignoring
 `node_modules`, plus its git `HEAD` and `index`. Directory times are ignored, so
@@ -34,7 +36,7 @@ removing `node_modules` does not restart the clock.
 - A git checkout of some other repo sitting in a worktree folder.
 - Running emulators, and images used by any container, including Docker Desktop's own.
 
-Before a worktree goes, uncommitted changes are saved as a patch, untracked files
+Before a git worktree goes (plain copies get no salvage), uncommitted changes are saved as a patch, untracked files
 up to 50 MB as a tarball, both in `~/Library/Application Support/MacJanitor/salvage/`
 for 30 days. A commit that no branch or remote holds gets a
 `refs/janitor/<name>-<time>` ref.

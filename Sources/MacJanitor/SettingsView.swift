@@ -48,15 +48,6 @@ struct SettingsView: View {
                            value: store.binding(\.scratchpadIdleDays))
             }
 
-            SettingsSection("Repos", help: "Worktrees of each repo, plus every folder in <repo>-worktrees, are managed",
-                    action: ("plus", "Add repo", store.addRepo)) {
-                ForEach(store.config.repos, id: \.self) { repo in
-                    ListRow(symbol: "folder", text: Format.path(repo), help: repo) {
-                        store.update { $0.repos.removeAll { $0 == repo } }
-                    }
-                }
-            }
-
             if !store.config.keep.isEmpty {
                 SettingsSection("Kept") {
                     ForEach(store.config.keep, id: \.self) { target in
@@ -84,15 +75,10 @@ struct SettingsView: View {
 
 private struct SettingsSection<Content: View>: View {
     let title: String
-    var help: String?
-    var action: (symbol: String, help: String, run: () -> Void)?
     @ViewBuilder let content: Content
 
-    init(_ title: String, help: String? = nil, action: (String, String, () -> Void)? = nil,
-         @ViewBuilder content: () -> Content) {
+    init(_ title: String, @ViewBuilder content: () -> Content) {
         self.title = title
-        self.help = help
-        self.action = action.map { (symbol: $0.0, help: $0.1, run: $0.2) }
         self.content = content()
     }
 
@@ -102,13 +88,7 @@ private struct SettingsSection<Content: View>: View {
                 Text(title)
                     .font(.caption.weight(.semibold))
                     .foregroundStyle(.secondary)
-                    .help(help ?? "")
                 Spacer()
-                if let action {
-                    Button(action: action.run) { Image(systemName: action.symbol) }
-                        .buttonStyle(.borderless)
-                        .help(action.help)
-                }
             }
             .frame(height: 18)
             .padding(.top, 10)

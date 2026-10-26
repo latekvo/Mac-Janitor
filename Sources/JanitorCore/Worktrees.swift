@@ -114,6 +114,10 @@ final class WorktreeJanitor {
     let guards: Guards
     let only: Set<String>?
     let now = Date()
+    /// Main checkouts with linked worktrees or a `<repo>-worktrees` folder.
+    let repos: [String]
+    /// Worktrees whose repo is gone.
+    let orphans: [String]
     var issues: [Issue] = []
     var skips: [Skip] = []
 
@@ -121,10 +125,47 @@ final class WorktreeJanitor {
         self.cfg = cfg
         self.guards = guards
         self.only = only
+        (repos, orphans) = Self.discover(under: cfg.worktreeSearchRoot)
     }
 
     /// Where a repo's worktrees live: `~/dev/x` -> `~/dev/x-worktrees`.
     static func root(_ repo: String) -> String { FS.normalize(repo) + "-worktrees" }
+
+    /// The git directory a `.git` file points to, resolved against the checkout.
+    static func gitdir(of checkout: String) -> String? {
+        guard let text = try? String(contentsOfFile: checkout + "/.git", encoding: .utf8),
+              text.hasPrefix("gitdir: ") else { return nil }
+        let dir = text.dropFirst(8).trimmingCharacters(in: .whitespacesAndNewlines)
+        return dir.hasPrefix("/") ? dir : FS.normalize(checkout + "/" + dir)
+    }
+
+    /// A checkout git can still read: a `.git` directory, or a `.git` file whose gitdir exists.
+    static func isLiveCheckout(_ path: String) -> Bool {
+        FS.isDirectory(path + "/.git") || gitdir(of: path).map(FS.exists) == true
+    }
+
+    /// One walk of `root`, staying on its volume (a stalled share would hang it), skipping
+    /// `Library`, `.Trash` and node_modules and never entering a `.git`: the repos to
+    /// manage and the orphaned worktrees.
+    static func discover(under root: String) -> (repos: [String], orphans: [String]) {
+        let root = FS.canonical(FS.normalize(root))
+        let volume = FS.lstatInfo(root)?.st_dev
+        var repos: [String] = [], orphans: [String] = []
+        FS.walk(root) { path, name, st, _ in
+            if st.st_dev != volume || name == "node_modules" || path == root + "/Library" || path == root + "/.Trash" {
+                return false
+            }
+            guard name == ".git" else { return true }
+            let checkout = (path as NSString).deletingLastPathComponent
+            if st.st_mode & S_IFMT == S_IFDIR {
+                if FS.isDirectory(path + "/worktrees") || FS.isDirectory(Self.root(checkout)) { repos.append(checkout) }
+            } else if let dir = gitdir(of: checkout), dir.contains("/worktrees/"), !FS.exists(dir) {
+                orphans.append(checkout)
+            }
+            return false
+        }
+        return (repos.sorted(), orphans.sorted())
+    }
 
     @discardableResult
     private func git(_ args: [String], cwd: String) -> ShellResult {
@@ -210,9 +251,7 @@ final class WorktreeJanitor {
     /// checkouts and staging touch. Not logs/HEAD: `git gc` rewrites every reflog at once.
     func idleDays(_ path: String, newestFile: Date?) -> Double {
         var newest = newestFile ?? FS.lstatInfo(path).map(FS.mtime) ?? .distantPast
-        if let gitFile = try? String(contentsOfFile: path + "/.git", encoding: .utf8),
-           gitFile.hasPrefix("gitdir: ") {
-            let gitdir = gitFile.dropFirst(8).trimmingCharacters(in: .whitespacesAndNewlines)
+        if let gitdir = Self.gitdir(of: path) {
             for f in ["HEAD", "index"] {
                 if let st = FS.lstatInfo(gitdir + "/" + f) { newest = max(newest, FS.mtime(st)) }
             }
@@ -264,12 +303,14 @@ final class WorktreeJanitor {
         let wantWhole = cfg.enabled(.worktree)
         var mainRef = "origin/main"
         var prs: [PRInfo] = []
-        if wantWhole {
+        // A local-only repo has nothing to fetch, and only GitHub has PRs to ask gh about.
+        let origin = git(["remote", "get-url", "origin"], cwd: repo)
+        if wantWhole && origin.ok {
             let fetch = Shell.run(["git", "fetch", "origin", "--prune", "--quiet"], cwd: repo, timeout: 300)
             if !fetch.ok { issues.append(Issue(.worktree, "git fetch failed in \(repo), merge checks use stale refs: \(fetch.stderr)")) }
             let head = git(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"], cwd: repo)
             if head.ok { mainRef = head.stdout.trimmingCharacters(in: .whitespacesAndNewlines) }
-            prs = fetchPRs(repo)
+            if origin.stdout.contains("github.com") { prs = fetchPRs(repo) }
         }
 
         let registered = registeredWorktrees(repo).filter { FS.isDirectory($0.path) }
@@ -280,32 +321,38 @@ final class WorktreeJanitor {
             let path = root + "/" + name
             if FS.isDirectory(path) && !known.contains(path) { paths.append((path, nil)) }
         }
-        let nested = Set(paths.map(\.0))
+        let nested = Set(paths.map(\.0)).union(orphans)
 
         var checkouts: [Checkout] = []
         var links: [NodeLink] = []
         for (path, entry) in paths {
-            let tree = scanTree(path, nested: nested)
-            // Measured before any git command, so our own reads cannot reset it.
-            var f = WorktreeFacts(path: path, isGit: entry != nil, idleDays: idleDays(path, newestFile: tree.newest))
-            f.locked = entry?.locked ?? false
-            if let entry, wantWhole { addGitFacts(&f, entry, repo: repo, mainRef: mainRef, prs: prs) }
-            // Tests and installs write here, so they count as use for this rule.
-            var nmIdle = f.idleDays
-            for extra in ["node_modules", "node_modules/.cache", "node_modules/.vite", "node_modules/.package-lock.json"] {
-                if let st = FS.lstatInfo(path + "/" + extra) { nmIdle = min(nmIdle, days(since: FS.mtime(st))) }
+            let c = checkout(path, entry: entry, repo: repo, nested: nested) { f in
+                if let entry, wantWhole { self.addGitFacts(&f, entry, repo: repo, mainRef: mainRef, prs: prs) }
             }
-            checkouts.append(Checkout(repo: repo, facts: f, entry: entry, nodeModules: tree.nodeModules, nodeModulesIdleDays: nmIdle))
-            links += tree.nodeModules.flatMap { self.links(checkout: path, nodeModules: $0) }
+            checkouts.append(c)
+            links += c.nodeModules.flatMap { self.links(checkout: path, nodeModules: $0) }
         }
         links += scanTree(repo, nested: nested).nodeModules.flatMap { self.links(checkout: repo, nodeModules: $0) }
         return (checkouts, links)
     }
 
+    func checkout(_ path: String, entry: Entry?, repo: String, nested: Set<String>,
+                  gitFacts: (inout WorktreeFacts) -> Void = { _ in }) -> Checkout {
+        let tree = scanTree(path, nested: nested)
+        // Measured before any git command, so our own reads cannot reset it.
+        var f = WorktreeFacts(path: path, isGit: entry != nil, idleDays: idleDays(path, newestFile: tree.newest))
+        f.locked = entry?.locked ?? false
+        gitFacts(&f)
+        // Tests and installs write here, so they count as use for this rule.
+        var nmIdle = f.idleDays
+        for extra in ["node_modules", "node_modules/.cache", "node_modules/.vite", "node_modules/.package-lock.json"] {
+            if let st = FS.lstatInfo(path + "/" + extra) { nmIdle = min(nmIdle, days(since: FS.mtime(st))) }
+        }
+        return Checkout(repo: repo, facts: f, entry: entry, nodeModules: tree.nodeModules, nodeModulesIdleDays: nmIdle)
+    }
+
     func plan() -> [Candidate] {
         guard cfg.enabled(.worktree) || cfg.enabled(.nodeModules) else { return [] }
-        var repos: [String] = []
-        for r in cfg.repos.map({ FS.canonical(FS.normalize($0)) }) where !repos.contains(r) { repos.append(r) }
         var checkouts: [Checkout] = []
         var links: [NodeLink] = []
         for repo in repos {
@@ -313,11 +360,19 @@ final class WorktreeJanitor {
             checkouts += s.checkouts
             links += s.links
         }
+        // Orphans in a `<repo>-worktrees` folder were already found as plain copies.
+        let seen = Set(checkouts.map(\.facts.path))
+        let nested = Set(orphans).union(seen)
+        for path in orphans where !seen.contains(path) {
+            let c = checkout(path, entry: nil, repo: "", nested: nested)
+            checkouts.append(c)
+            links += c.nodeModules.flatMap { self.links(checkout: path, nodeModules: $0) }
+        }
 
         var candidates: [Candidate] = []
         for c in checkouts {
             let f = c.facts
-            if !f.isGit && FS.exists(f.path + "/.git") {
+            if !f.isGit && Self.isLiveCheckout(f.path) {
                 // Some other repo's checkout: its unpushed work is invisible from here.
                 if cfg.enabled(.worktree) && f.idleDays > cfg.abandonedIdleDays {
                     skips.append(Skip(category: .worktree, target: f.path,

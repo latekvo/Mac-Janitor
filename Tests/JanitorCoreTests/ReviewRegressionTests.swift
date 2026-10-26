@@ -70,9 +70,9 @@ final class ReviewRegressionTests: XCTestCase {
         try? FileManager.default.removeItem(atPath: root)
     }
 
-    func cfg(_ repos: [String]) -> Config {
+    func cfg(protecting repos: [String]) -> Config {
         var c = Config()
-        c.repos = repos
+        c.worktreeSearchRoot = root
         c.salvageDir = root + "/salvage"
         Safety.protectedPaths = (repos + repos.map(WorktreeJanitor.root) + [root]).map(FS.canonical)
         return c
@@ -89,7 +89,7 @@ final class ReviewRegressionTests: XCTestCase {
         for f in ["/a.txt", "/.gitignore", "/.git"] { backdate(outer + f, days: 40) }
         let og = try String(contentsOfFile: outer + "/.git", encoding: .utf8).dropFirst(8).trimmingCharacters(in: .whitespacesAndNewlines)
         backdate(og, days: 40)
-        let j = WorktreeJanitor(cfg: cfg([repo]), guards: try Guards.gather())
+        let j = WorktreeJanitor(cfg: cfg(protecting: [repo]), guards: try Guards.gather())
         XCTAssertEqual(j.plan().map(\.action.target), [])
         XCTAssertTrue(j.skips.contains { $0.target == outer && $0.reason.hasSuffix("it contains the worktree \(inner)") }, "\(j.skips)")
     }
@@ -101,7 +101,7 @@ final class ReviewRegressionTests: XCTestCase {
         try write(wt + "/node_modules/x/index.js", "x")
         age(repo, wt, days: 40)
         for keep in [wt + "/node_modules", wt + "/", wt.replacingOccurrences(of: "/private/var/", with: "/var/")] {
-            var c = cfg([repo])
+            var c = cfg(protecting: [repo])
             c.keep = [keep]
             let j = WorktreeJanitor(cfg: c, guards: try Guards.gather())
             XCTAssertEqual(j.plan().map(\.action.target), [], keep)
@@ -123,7 +123,7 @@ final class ReviewRegressionTests: XCTestCase {
         try p.run()
         defer { p.terminate() }
         Thread.sleep(forTimeInterval: 0.3)
-        let j = WorktreeJanitor(cfg: cfg([repo]), guards: try Guards.gather())
+        let j = WorktreeJanitor(cfg: cfg(protecting: [repo]), guards: try Guards.gather())
         XCTAssertEqual(j.plan().map(\.action.target), [])
         XCTAssertTrue(j.skips.contains { $0.target == wt + "/node_modules" && $0.reason.contains("in use") }, "\(j.skips)")
     }
@@ -138,7 +138,7 @@ final class ReviewRegressionTests: XCTestCase {
         try link(d + "/node_modules/@s/p", to: "../../packages/p")
         try link(h + "/node_modules", to: d + "/node_modules")
         age(repo, d, days: 5)
-        var c = cfg([repo])
+        var c = cfg(protecting: [repo])
         c.disabled = [.worktree]
         let j = WorktreeJanitor(cfg: c, guards: try Guards.gather())
         // Only the package no borrower can reach goes.
@@ -156,7 +156,7 @@ final class ReviewRegressionTests: XCTestCase {
         sh(["git", "commit", "-q", "--allow-empty", "-m", "two"], cwd: wc)
         let heads = [sh(["git", "rev-parse", "HEAD"], cwd: wa), sh(["git", "rev-parse", "HEAD"], cwd: wc)]
         for (r, w) in [(a, wa), (b, wb), (a, wc)] { age(r, w, days: 40) }
-        let c = cfg([a, b])
+        let c = cfg(protecting: [a, b])
         let j = WorktreeJanitor(cfg: c, guards: try Guards.gather())
         let res = j.plan().map(j.execute)
         XCTAssertEqual(res.map(\.status), [.removed, .removed, .removed])
@@ -168,15 +168,46 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertEqual(Set(refs.split(separator: "\n").map(String.init)), Set(heads))
     }
 
-    func testDuplicateRepoSpellingsPlanOnce() throws {
-        let repo = try makeRepo("repo")
-        let wt = repo + "-worktrees/w"
-        addWT(repo, wt)
-        try write(wt + "/node_modules/x/index.js", "x")
-        age(repo, wt, days: 5)
-        var c = cfg([repo, repo + "/"])
-        c.disabled = [.worktree]
-        XCTAssertEqual(WorktreeJanitor(cfg: c, guards: try Guards.gather()).plan().map(\.action.target), [wt + "/node_modules"])
+    func testDiscoveryFindsEveryRepoWithWorktreesAndEveryOrphan() throws {
+        let claude = try makeRepo("claude"), sibling = try makeRepo("sibling"), plain = try makeRepo("plain")
+        try FileManager.default.removeItem(atPath: plain + "-worktrees")
+        try FileManager.default.removeItem(atPath: claude + "-worktrees")
+        addWT(claude, claude + "/.claude/worktrees/agent")
+        try write(plain + "/node_modules/pkg/.git/HEAD", "ref: refs/heads/main\n")
+        try FileManager.default.createDirectory(atPath: plain + "/node_modules/pkg-worktrees", withIntermediateDirectories: true)
+        let local = root + "/local"
+        sh(["git", "init", "-q", "-b", "main", local], cwd: root)
+        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "init"], cwd: local)
+        addWT(local, local + "-worktrees/w")
+        // A gone repo's worktrees: one among a live repo's plain copies, one only discovery finds.
+        let moved = try makeRepo("moved")
+        let inRoot = sibling + "-worktrees/old", outside = root + "/elsewhere/.claude/worktrees/old"
+        addWT(moved, inRoot)
+        addWT(moved, outside)
+        addWT(sibling, sibling + "-worktrees/live")
+        let rel = sibling + "-worktrees/rel"
+        addWT(sibling, rel)
+        try write(rel + "/.git", "gitdir: ../../sibling/.git/worktrees/rel\n")
+        // Plain copies alone make a repo managed.
+        let copies = try makeRepo("copies")
+        try write(copies + "-worktrees/snapshot/a.txt", "x")
+        backdate(copies + "-worktrees/snapshot", days: 40)
+        try FileManager.default.removeItem(atPath: moved + "/.git")
+        for p in [inRoot, outside] { backdate(p, days: 40) }
+        // Another volume is not walked.
+        let dmg = root + "/v.dmg", volume = root + "/volume"
+        sh(["hdiutil", "create", "-quiet", "-size", "2m", "-fs", "APFS", "-volname", "v", dmg], cwd: root)
+        sh(["hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", volume, dmg], cwd: root)
+        defer { Shell.run(["hdiutil", "detach", "-quiet", "-force", volume]) }
+        try FileManager.default.createDirectory(atPath: volume + "/r/.git/worktrees", withIntermediateDirectories: true)
+
+        let j = WorktreeJanitor(cfg: cfg(protecting: [claude, copies, sibling, plain, local]), guards: try Guards.gather())
+        XCTAssertEqual(j.repos, [claude, copies, local, sibling])
+        XCTAssertEqual(j.orphans, [inRoot, outside].sorted())
+        XCTAssertEqual(Set(j.plan().filter { $0.action.category == .worktree }.map(\.action.target)),
+                       [inRoot, outside, copies + "-worktrees/snapshot"])
+        // Without a remote there is nothing to fetch or ask GitHub about.
+        XCTAssertEqual(j.issues.filter { $0.message.contains(local) }.map(\.message), [])
     }
 
     func testNonUTF8EditsSalvageByteForByte() throws {
@@ -189,7 +220,7 @@ final class ReviewRegressionTests: XCTestCase {
         addWT(repo, wt)
         try Data([0x6E, 0x61, 0xEF, 0x76, 0x65, 0x0A]).write(to: URL(fileURLWithPath: wt + "/l.txt"))
         age(repo, wt, days: 40)
-        let c = cfg([repo])
+        let c = cfg(protecting: [repo])
         let j = WorktreeJanitor(cfg: c, guards: try Guards.gather())
         XCTAssertEqual(j.plan().map(j.execute).map(\.status), [.removed])
         let patch = try XCTUnwrap(try FileManager.default.contentsOfDirectory(atPath: c.salvageDir).first { $0.hasSuffix(".patch") })
@@ -204,7 +235,7 @@ final class ReviewRegressionTests: XCTestCase {
         try Data(count: Int(WorktreeJanitor.salvageCap) + 1).write(to: URL(fileURLWithPath: big + "/blob.bin"))
         age(repo, merged, days: 2)
         age(repo, big, days: 40)
-        let j = WorktreeJanitor(cfg: cfg([repo]), guards: try Guards.gather())
+        let j = WorktreeJanitor(cfg: cfg(protecting: [repo]), guards: try Guards.gather())
         XCTAssertEqual(j.plan().map(\.action.target), [])
         XCTAssertTrue(j.skips.contains { $0.target == big && $0.reason.hasSuffix("too big to salvage") }, "\(j.skips)")
     }
