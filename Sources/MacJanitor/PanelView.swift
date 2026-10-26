@@ -344,7 +344,7 @@ private struct CleanButton: View {
             .frame(maxWidth: .infinity)
         }
         .buttonStyle(ProminentButtonStyle(active: store.busy == .cleaning))
-        .disabled(store.busy != nil || store.planned.isEmpty)
+        .disabled(!store.canClean)
     }
 }
 

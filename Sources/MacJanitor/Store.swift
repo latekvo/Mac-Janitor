@@ -40,6 +40,8 @@ final class Store: ObservableObject {
 
     /// The config `preview` was planned with.
     private var previewedWith: Config?
+    /// Identifies the latest preview; a clean bumps it to discard one in flight.
+    private var previewID = 0
     private let live: Bool
     private var panelOpen = false
     private var timer: Timer?
@@ -217,11 +219,14 @@ final class Store: ObservableObject {
     func runPreview() async {
         guard live, busy == nil else { return }
         busy = .previewing
+        previewID += 1
+        let id = previewID
         let cfg = config
         let outcome = await JanitorRunner.run(dryRun: true)
+        // A clean started meanwhile; this plan predates it.
+        guard id == previewID else { return }
         busy = nil
         refresh()
-        if outcome.locked { return watchScheduledRun() }
         problem = outcome.problem
         if let report = outcome.report {
             preview = report
@@ -231,9 +236,13 @@ final class Store: ObservableObject {
         }
     }
 
+    /// Can run while a preview refreshes: the CLI acts only on ids it still plans.
+    var canClean: Bool { (busy == nil || busy == .previewing) && !planned.isEmpty }
+
     func clean() async {
         let ids = planned.map(\.id)
-        guard live, busy == nil, !ids.isEmpty else { return }
+        guard live, canClean else { return }
+        previewID += 1
         busy = .cleaning
         problem = nil
         let outcome = await JanitorRunner.run(dryRun: false, only: ids)

@@ -125,6 +125,7 @@ enum Snapshot {
                 return s
             }),
             ("c-previewing", { Store(freeBytes: 124 * gb, totalBytes: total, lastRun: lastRun, busy: .previewing) }),
+            ("c-refreshing", { Store(freeBytes: 124 * gb, totalBytes: total, lastRun: lastRun, preview: mixedPreview, busy: .previewing) }),
             ("d-low-disk", { Store(freeBytes: 12_400_000_000, totalBytes: total, lastRun: lastRun, preview: mixedPreview) }),
             ("e-settings", {
                 var cfg = Config()
