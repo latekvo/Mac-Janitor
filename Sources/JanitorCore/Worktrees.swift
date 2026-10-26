@@ -236,6 +236,8 @@ final class WorktreeJanitor {
         var facts: WorktreeFacts
         var entry: Entry?
         var nodeModules: [String]
+        /// Checkouts inside this one that no scan covers.
+        var inner: [String]
         /// Days since the checkout or its installed packages last changed.
         var nodeModulesIdleDays: Double
     }
@@ -278,11 +280,16 @@ final class WorktreeJanitor {
     /// One walk of a checkout, not entering node_modules, `.git` or `nested` checkouts:
     /// the newest file mtime and the node_modules directories or links.
     /// Directory mtimes are ignored, since removing node_modules bumps them.
-    func scanTree(_ root: String, nested: Set<String>) -> (newest: Date?, nodeModules: [String]) {
+    func scanTree(_ root: String, nested: Set<String>) -> (newest: Date?, nodeModules: [String], inner: [String]) {
         var newest: Date?
-        var nodeModules: [String] = []
+        var nodeModules: [String] = [], inner: [String] = []
         FS.walk(root, skipping: mounts) { path, name, st, _ in
             let type = st.st_mode & S_IFMT
+            // Checkouts discovery never reached, as under /tmp; a submodule is part of this one.
+            if name == ".git" && path != root + "/.git" {
+                let checkout = (path as NSString).deletingLastPathComponent
+                if type == S_IFDIR || Self.gitdir(of: checkout).map(Self.isWorktreeGitdir) == true { inner.append(checkout) }
+            }
             if type == S_IFDIR && (name == ".git" || nested.contains(path)) { return false }
             if name == "node_modules" && (type == S_IFDIR || type == S_IFLNK) {
                 nodeModules.append(path)
@@ -291,7 +298,7 @@ final class WorktreeJanitor {
             if type != S_IFDIR { newest = max(newest ?? .distantPast, FS.mtime(st)) }
             return true
         }
-        return (newest, nodeModules)
+        return (newest, nodeModules, inner)
     }
 
     /// Idle time counts the worktree's git HEAD and index, which commits,
@@ -405,7 +412,8 @@ final class WorktreeJanitor {
         for extra in ["node_modules", "node_modules/.cache", "node_modules/.vite", "node_modules/.package-lock.json"] {
             if let st = FS.lstatInfo(path + "/" + extra) { nmIdle = min(nmIdle, days(since: FS.mtime(st))) }
         }
-        return Checkout(repo: repo, facts: f, entry: entry, nodeModules: tree.nodeModules, nodeModulesIdleDays: nmIdle)
+        return Checkout(repo: repo, facts: f, entry: entry, nodeModules: tree.nodeModules, inner: tree.inner,
+                        nodeModulesIdleDays: nmIdle)
     }
 
     func plan() -> [Candidate] {
@@ -498,7 +506,7 @@ final class WorktreeJanitor {
         // A donor's packages must outlive every checkout still linking into them,
         // including through links inside the donor (workspace packages), and a
         // worktree must outlive the worktrees nested in it.
-        let allCheckouts = checkouts.map(\.facts.path) + self.checkouts
+        let allCheckouts = checkouts.flatMap { [$0.facts.path] + $0.inner } + self.checkouts
         var changed = true
         while changed {
             changed = false
@@ -546,6 +554,16 @@ final class WorktreeJanitor {
 
     /// Why removing this worktree would lose work salvage cannot keep, or nil.
     func unsalvageable(_ path: String) -> String? {
+        // A linked worktree's submodule repos live in its own git dir and go with it.
+        // `S<c><m><u>`: new commits, changes or untracked files.
+        let status = git(["status", "--porcelain=v2", "--ignore-submodules=none"], cwd: path)
+        guard status.ok else { return "git status failed: \(status.stderr)" }
+        let busy = status.stdout.split(separator: "\n").compactMap { line -> String? in
+            let f = line.split(separator: " ", maxSplits: 8)
+            guard f.count == 9, f[0] == "1" || f[0] == "2", f[2].hasPrefix("S"), f[2] != "S..." else { return nil }
+            return String(f[8])
+        }
+        if let sub = busy.first { return "its submodule \(sub) has work salvage cannot keep" }
         let u = untracked(path)
         guard u.bytes > Self.salvageCap else { return nil }
         return "its \(u.files.count) untracked files (\(u.bytes / 1_000_000) MB) are too big to salvage"

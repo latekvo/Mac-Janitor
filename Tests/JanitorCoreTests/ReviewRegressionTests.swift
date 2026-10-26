@@ -272,8 +272,8 @@ final class ReviewRegressionTests: XCTestCase {
         // Of a repo scanned after `repo`, so only the order of execution puts it first.
         let late = try makeRepo("zz")
         addWT(late, inner)
-        try write(inner + "/.git", "garbage\n")
         backdate(outer, days: 40)
+        age(late, inner, days: 40)
         let other = try makeRepo("other")
         let x = repo + "-worktrees/x"
         addWT(other, x)
@@ -286,7 +286,10 @@ final class ReviewRegressionTests: XCTestCase {
 
         c.disabled = [.nodeModules]
         let j = WorktreeJanitor(cfg: c, guards: try Guards.gather())
-        let results = j.plan().filter { $0.action.target.hasPrefix(outer) }.map(j.execute)
+        let plan = j.plan().filter { $0.action.target.hasPrefix(outer) }
+        // Salvage fails once git cannot read the inner worktree.
+        try write(inner + "/.git", "garbage\n")
+        let results = plan.map(j.execute)
         XCTAssertEqual(results.map(\.target), [inner, outer])
         XCTAssertEqual(results.map(\.status), [.failed, .failed])
         XCTAssertEqual(results.last?.error, "it contains \(inner), which stays")
@@ -349,7 +352,9 @@ final class ReviewRegressionTests: XCTestCase {
         sh(["hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", onVolume, root + "/mw.dmg"], cwd: root)
         defer { Shell.run(["hdiutil", "detach", "-quiet", "-force", onVolume]) }
         addWT(r, onVolume)
+        try Data(count: 4_000_000).write(to: URL(fileURLWithPath: onVolume + "/big.bin"))
         age(r, onVolume, days: 2)
+        XCTAssertLessThan(FS.allocatedSize(r + "-worktrees"), 4_000_000)
 
         let j = WorktreeJanitor(cfg: cfg(protecting: [r]), guards: try Guards.gather())
         let plan = j.plan()
@@ -360,6 +365,39 @@ final class ReviewRegressionTests: XCTestCase {
         defer { Shell.run(["hdiutil", "detach", "-quiet", "-force", late + "/vol"]) }
         XCTAssertEqual(plan.map(j.execute).map(\.error), ["it contains \(late)/vol, which stays"])
         XCTAssertTrue(FS.exists(late + "/a.txt"))
+    }
+
+    func testSubmoduleWorkAndCheckoutsBeyondTheSearchRootStay() throws {
+        let sub = try makeRepo("sub"), sup = try makeRepo("sup")
+        sh(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "s"], cwd: sup)
+        sh(["git", "commit", "-q", "-m", "add s"], cwd: sup)
+        sh(["git", "push", "-q", "origin", "main"], cwd: sup)
+        let w = sup + "-worktrees/w"
+        sh(["git", "worktree", "add", "-q", "--detach", w, "origin/main"], cwd: sup)
+        sh(["git", "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"], cwd: w)
+        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "local"], cwd: w + "/s")
+        age(sup, w, days: 2)
+        let clean = sup + "-worktrees/clean"
+        sh(["git", "worktree", "add", "-q", "--detach", clean, "origin/main"], cwd: sup)
+        sh(["git", "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"], cwd: clean)
+        age(sup, clean, days: 2)
+        let broken = sup + "-worktrees/broken"
+        addWT(sup, broken)
+        try write(broken + "/.git", "garbage\n")
+        backdate(broken, days: 40)
+        // Registered outside the walked folder, holding a clone with commits of its own.
+        let away = FS.canonical(FileManager.default.temporaryDirectory.path) + "/janitor-away-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: away) }
+        addWT(sup, away)
+        sh(["git", "init", "-q", away + "/clone"], cwd: root)
+        age(sup, away, days: 40)
+
+        let j = WorktreeJanitor(cfg: cfg(protecting: [sub, sup]), guards: try Guards.gather())
+        XCTAssertEqual(j.plan().map(\.action.target), [clean])
+        let reasons = Dictionary(uniqueKeysWithValues: j.skips.map { ($0.target, $0.reason) })
+        XCTAssertTrue(reasons[w]?.hasSuffix("but its submodule s has work salvage cannot keep") == true, "\(j.skips)")
+        XCTAssertTrue(reasons[away]?.hasSuffix("but it contains the checkout \(away)/clone") == true, "\(j.skips)")
+        XCTAssertTrue(reasons[broken]?.contains("but git status failed") == true, "\(j.skips)")
     }
 
     func testNonUTF8EditsSalvageByteForByte() throws {
