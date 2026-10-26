@@ -628,7 +628,7 @@ final class WorktreeJanitor {
                 let r = git(["worktree", "remove", "--force", "--force", a.target], cwd: repo)
                 if !r.ok {
                     try FS.remove(a.target)
-                    // Only this record: `git worktree prune` would also drop moved worktrees' records.
+                    // Not `git worktree prune`, which drops every lost record, moved worktrees' too.
                     if let record, Self.isWorktreeGitdir(record), FS.exists(record) { try FS.remove(record) }
                 }
             }

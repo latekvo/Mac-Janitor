@@ -38,6 +38,7 @@ removing `node_modules` does not restart the clock.
   or a mounted volume.
 - A worktree whose submodules hold commits no remote has, changes or untracked files: they live in
   the worktree's git dir and salvage cannot keep them.
+- A worktree with over 50 MB of untracked files, too much to salvage.
 - Running emulators, and images used by any container, including Docker Desktop's own.
 
 Before a git worktree goes (plain copies get no salvage), uncommitted changes are saved as a patch, untracked files
