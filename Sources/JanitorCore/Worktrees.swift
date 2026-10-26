@@ -221,8 +221,9 @@ final class WorktreeJanitor {
     }
 
     @discardableResult
+    /// fsmonitor would leave a daemon holding each worktree open, which then vetoes its removal.
     private func git(_ args: [String], cwd: String) -> ShellResult {
-        Shell.run(["git", "--no-optional-locks"] + args, cwd: cwd)
+        Shell.run(["git", "--no-optional-locks", "-c", "core.fsmonitor=false"] + args, cwd: cwd)
     }
 
     private func days(since date: Date?) -> Double {
@@ -554,9 +555,10 @@ final class WorktreeJanitor {
     static let salvageCap: Int64 = 50_000_000
 
     /// Untracked, non-ignored files: what salvage tars up.
-    func untracked(_ path: String) -> (files: [String], bytes: Int64) {
-        let files = git(["ls-files", "--others", "--exclude-standard", "-z"], cwd: path).stdout
-            .split(separator: "\0").map(String.init)
+    func untracked(_ path: String) -> (files: [String], bytes: Int64)? {
+        let r = git(["ls-files", "--others", "--exclude-standard", "-z"], cwd: path)
+        guard r.ok else { return nil }
+        let files = r.stdout.split(separator: "\0").map(String.init)
         return (files, files.reduce(Int64(0)) { $0 + FS.allocatedSize(path + "/" + $1) })
     }
 
@@ -599,7 +601,7 @@ final class WorktreeJanitor {
                 return "its submodule repo \(dir) holds commits no remote has"
             }
         }
-        let u = untracked(path)
+        guard let u = untracked(path) else { return "git ls-files failed" }
         guard u.bytes > Self.salvageCap else { return nil }
         return "its \(u.files.count) untracked files (\(u.bytes / 1_000_000) MB) are too big to salvage"
     }
@@ -644,12 +646,16 @@ final class WorktreeJanitor {
     func salvage(_ path: String, head: String, repo: String) throws -> String? {
         // The path hash keeps same-named worktrees of different folders apart.
         let digest = SHA256.hash(data: Data(path.utf8)).prefix(4).map { String(format: "%02x", $0) }.joined()
-        let name = (path as NSString).lastPathComponent + "-" + digest
+        // Also a ref name, which allows no spaces, `~`, `:` or leading dots.
+        let base = (path as NSString).lastPathComponent.unicodeScalars
+            .map { CharacterSet.alphanumerics.contains($0) || $0 == "_" || $0 == "-" ? String($0) : "-" }.joined()
+        let name = base + "-" + digest
         let stamp = ISO8601DateFormatter().string(from: now).replacingOccurrences(of: ":", with: "")
         var kept: [String] = []
 
         let held = git(["for-each-ref", "--count=1", "--contains", head, "refs/heads", "refs/remotes", "refs/janitor"], cwd: repo)
-        if held.ok && held.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        guard held.ok else { throw JanitorError("git for-each-ref failed: \(held.stderr)") }
+        if held.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             let ref = "refs/janitor/\(name)-\(stamp)"
             guard git(["update-ref", ref, head], cwd: repo).ok else { throw JanitorError("could not create \(ref)") }
             kept.append(ref)
@@ -659,15 +665,16 @@ final class WorktreeJanitor {
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
         // Written by git itself: the patch must survive non-UTF-8 content byte for byte.
         let patch = "\(dir)/\(name)-\(stamp).patch"
-        // A diff.external tool or textconv driver would replace or garble the patch.
-        let diff = git(["diff", "--no-ext-diff", "--no-textconv", "HEAD", "--binary", "--output=\(patch)"], cwd: path)
+        // Pinned against config: diff.external, textconv, color, noprefix and context garble a patch.
+        let diff = git(["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--src-prefix=a/", "--dst-prefix=b/", "-U3",
+                        "HEAD", "--binary", "--output=\(patch)"], cwd: path)
         guard diff.ok else { throw JanitorError("git diff failed in \(path): \(diff.stderr)") }
         if (FS.lstatInfo(patch)?.st_size ?? 0) > 0 {
             kept.append(patch)
         } else {
             try? FileManager.default.removeItem(atPath: patch)
         }
-        let u = untracked(path)
+        guard let u = untracked(path) else { throw JanitorError("git ls-files failed in \(path)") }
         if !u.files.isEmpty {
             guard u.bytes <= Self.salvageCap else {
                 throw JanitorError("\(u.files.count) untracked files (\(u.bytes / 1_000_000) MB) are too big to salvage")

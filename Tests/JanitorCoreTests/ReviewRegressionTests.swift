@@ -447,18 +447,47 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertEqual(j.skips.map(\.reason), ["untouched for 40 days, but no repo found holds this worktree"])
     }
 
+    func testFsmonitorAndOddNamesDoNotKeepWorktreesForever() throws {
+        let repo = try makeRepo("repo")
+        let merged = repo + "-worktrees/merged", odd = repo + "-worktrees/a b~"
+        addWT(repo, merged)
+        defer { Shell.run(["git", "fsmonitor--daemon", "stop"], cwd: merged) }
+        addWT(repo, odd)
+        defer { Shell.run(["git", "fsmonitor--daemon", "stop"], cwd: odd) }
+        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "local"], cwd: odd)
+        let local = sh(["git", "rev-parse", "HEAD"], cwd: odd)
+        age(repo, merged, days: 2)
+        age(repo, odd, days: 40)
+        // Last, so no git command of this test starts a daemon.
+        sh(["git", "config", "core.fsmonitor", "true"], cwd: repo)
+        let j = WorktreeJanitor(cfg: cfg(protecting: [repo]), guards: try Guards.gather())
+        let plan = j.plan()
+        XCTAssertEqual(Set(plan.map(\.action.target)), [merged, odd])
+        // The guards taken right before deleting see no daemon of ours.
+        let fresh = try Guards.gather()
+        XCTAssertEqual(plan.compactMap { fresh.veto($0.action.target) }, [])
+        XCTAssertEqual(plan.map(j.execute).map(\.status), [.removed, .removed])
+        let refs = sh(["git", "for-each-ref", "--format=%(refname) %(objectname)", "refs/janitor"], cwd: repo)
+        XCTAssertTrue(refs.hasPrefix("refs/janitor/a-b--") && refs.hasSuffix(" " + local), refs)
+    }
+
     func testNonUTF8EditsSalvageByteForByte() throws {
         let repo = try makeRepo("repo")
         try Data([0x63, 0x61, 0x66, 0xE9, 0x0A]).write(to: URL(fileURLWithPath: repo + "/l.txt"))
-        sh(["git", "add", "l.txt"], cwd: repo)
+        try write(repo + "/m.txt", "1\n2\n3\n4\n5\n")
+        sh(["git", "add", "l.txt", "m.txt"], cwd: repo)
         sh(["git", "commit", "-q", "-m", "latin"], cwd: repo)
         sh(["git", "push", "-q", "origin", "main"], cwd: repo)
         let wt = repo + "-worktrees/w"
         addWT(repo, wt)
         try Data([0x6E, 0x61, 0xEF, 0x76, 0x65, 0x0A]).write(to: URL(fileURLWithPath: wt + "/l.txt"))
+        try write(wt + "/m.txt", "1\n2\nthree\n4\n5\n")
         // Diff settings from the user's config must not shape the patch.
         sh(["git", "config", "diff.external", "echo"], cwd: repo)
         sh(["git", "config", "diff.upper.textconv", "tr a-z A-Z <"], cwd: repo)
+        for (key, value) in [("color.diff", "always"), ("diff.noprefix", "true"), ("diff.context", "0")] {
+            sh(["git", "config", key, value], cwd: repo)
+        }
         try write(repo + "/.git/info/attributes", "*.txt diff=upper\n")
         age(repo, wt, days: 40)
         let c = cfg(protecting: [repo])
