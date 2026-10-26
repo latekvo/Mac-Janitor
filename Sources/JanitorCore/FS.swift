@@ -75,12 +75,13 @@ public enum FS {
     }
 
     /// Allocated bytes under `root`, counting each hard-linked inode once.
+    /// Stops at mount points: another volume's bytes are not freed with `root`.
     public static func allocatedSize(_ root: String) -> Int64 {
         guard let rootSt = lstatInfo(root) else { return 0 }
         var total = Int64(rootSt.st_blocks) * 512
         if rootSt.st_mode & S_IFMT != S_IFDIR { return total }
         var seen = Set<UInt64>()
-        walk(root) { _, _, st, _ in
+        walk(root, skipping: mountPoints()) { _, _, st, _ in
             if st.st_nlink > 1 && st.st_mode & S_IFMT != S_IFDIR {
                 if !seen.insert(st.st_ino).inserted { return true }
             }

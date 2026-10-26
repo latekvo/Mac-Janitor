@@ -262,7 +262,7 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertEqual(reasons[copies + "-worktrees/linked"], "untouched for 40 days, but it is a git checkout of another repo")
         XCTAssertNil(reasons[broken])
         XCTAssertEqual(j.skips.filter { $0.target.hasPrefix(holder) }.map(\.target), [])
-        XCTAssertTrue(j.issues.contains { $0.message.hasPrefix("1 worktrees of \(moved) ") && $0.message.hasSuffix(w) }, "\(j.issues)")
+        XCTAssertTrue(j.issues.contains { $0.message.hasPrefix("1 worktrees look like ones \(moved) lost") && $0.message.hasSuffix(w) }, "\(j.issues)")
     }
 
     func testAFailureInsideStopsItsContainerAndCrossRepoWorktreesPlanOnce() throws {
@@ -322,6 +322,44 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertEqual(j.plan().map(\.action.target), [])
         let reasons = Dictionary(uniqueKeysWithValues: j.skips.map { ($0.target, $0.reason) })
         XCTAssertEqual(reasons[copy], "abandoned: untouched for 40.0 days, but a volume is mounted at \(volume)")
+    }
+
+    func testCloneAtAStaleWorktreePathAndMountsAtOrIntoTargetsStay() throws {
+        let r = try makeRepo("r")
+        let w = r + "-worktrees/w"
+        addWT(r, w)
+        try FileManager.default.removeItem(atPath: w)
+        sh(["git", "clone", "-q", r, w], cwd: root)
+        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "mine"], cwd: w)
+        backdate(w, days: 40)
+        let at = r + "-worktrees/vol", dmg = root + "/v.dmg"
+        sh(["hdiutil", "create", "-quiet", "-size", "2m", "-fs", "APFS", "-volname", "v", dmg], cwd: root)
+        try FileManager.default.createDirectory(atPath: at, withIntermediateDirectories: true)
+        sh(["hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", at, dmg], cwd: root)
+        defer { Shell.run(["hdiutil", "detach", "-quiet", "-force", at]) }
+        try write(at + "/precious.txt", "x")
+        backdate(at, days: 40)
+        let late = r + "-worktrees/late"
+        try write(late + "/a.txt", "x")
+        backdate(late, days: 40)
+        // A merged worktree on a volume of its own.
+        let onVolume = r + "-worktrees/mw"
+        sh(["hdiutil", "create", "-quiet", "-size", "8m", "-fs", "APFS", "-volname", "mw", root + "/mw.dmg"], cwd: root)
+        try FileManager.default.createDirectory(atPath: onVolume, withIntermediateDirectories: true)
+        sh(["hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", onVolume, root + "/mw.dmg"], cwd: root)
+        defer { Shell.run(["hdiutil", "detach", "-quiet", "-force", onVolume]) }
+        addWT(r, onVolume)
+        age(r, onVolume, days: 2)
+
+        let j = WorktreeJanitor(cfg: cfg(protecting: [r]), guards: try Guards.gather())
+        let plan = j.plan()
+        XCTAssertEqual(plan.map(\.action.target), [late])
+        // Mounted after planning.
+        sh(["hdiutil", "create", "-quiet", "-size", "2m", "-fs", "APFS", "-volname", "v2", root + "/v2.dmg"], cwd: root)
+        sh(["hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", late + "/vol", root + "/v2.dmg"], cwd: root)
+        defer { Shell.run(["hdiutil", "detach", "-quiet", "-force", late + "/vol"]) }
+        XCTAssertEqual(plan.map(j.execute).map(\.error), ["it contains \(late)/vol, which stays"])
+        XCTAssertTrue(FS.exists(late + "/a.txt"))
     }
 
     func testNonUTF8EditsSalvageByteForByte() throws {

@@ -361,20 +361,22 @@ final class WorktreeJanitor {
             if origin.stdout.contains("github.com") { prs = fetchPRs(repo) }
         }
 
-        // A copy of a repo keeps records of the original's worktrees, with stale HEADs:
-        // only the repo a worktree's `.git` points into speaks for it. An unreadable
-        // `.git` proves nothing, and its failing salvage keeps it.
-        let all = registeredWorktrees(repo).filter { FS.isDirectory($0.path) }
+        // A copy of a repo keeps records of the original's worktrees, with stale HEADs,
+        // and a record outlives a worktree deleted without git: only the repo a worktree's
+        // `.git` points into speaks for it. A clone there is not it; an unreadable `.git`
+        // proves nothing, and its failing salvage keeps it.
+        let all = registeredWorktrees(repo).filter { FS.isDirectory($0.path) && !mounts.contains($0.path) }
         let own = FS.canonical(repo + "/.git/worktrees")
         let registered = all.filter { e in
-            Self.gitdir(of: e.path).map { FS.canonical(($0 as NSString).deletingLastPathComponent) == own } ?? true
+            guard !Self.hasGitDirectory(e.path) else { return false }
+            return Self.gitdir(of: e.path).map { FS.canonical(($0 as NSString).deletingLastPathComponent) == own } ?? true
         }
         var paths: [(String, Entry?)] = registered.map { ($0.path, $0) }
         let known = Set(all.map(\.path))
         let root = FS.canonical(Self.root(repo))
         for name in (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? [] {
             let path = root + "/" + name
-            if FS.isDirectory(path) && !known.contains(path) { paths.append((path, nil)) }
+            if !mounts.contains(path) && FS.isDirectory(path) && !known.contains(path) { paths.append((path, nil)) }
         }
         let nested = Set(paths.map(\.0)).union(checkouts)
 
@@ -425,8 +427,8 @@ final class WorktreeJanitor {
         }
 
         for (repo, moved) in Dictionary(grouping: disconnected.keys, by: { disconnected[$0]! }).sorted(by: { $0.key < $1.key }) {
-            issues.append(Issue(.worktree, "\(moved.count) worktrees of \(repo) lost their link to it in a move and are never removed "
-                                + "whole until `git -C \(repo) worktree repair <paths>` reconnects them, e.g. \(moved.sorted()[0])"))
+            issues.append(Issue(.worktree, "\(moved.count) worktrees look like ones \(repo) lost in a move, so none is removed whole; "
+                                + "if they are, `git -C \(repo) worktree repair <paths>` reconnects them, e.g. \(moved.sorted()[0])"))
         }
 
         // A worktree of one repo in another's `-worktrees` folder was found by both.
@@ -551,7 +553,10 @@ final class WorktreeJanitor {
 
     func execute(_ c: Candidate) -> Action {
         var a = c.action
-        if let inner = stayed.first(where: { $0.hasPrefix(a.target + "/") }) {
+        // Mounted since planning, which can take minutes.
+        let inner = stayed.first { $0.hasPrefix(a.target + "/") }
+            ?? FS.mountPoints().first { $0 == a.target || $0.hasPrefix(a.target + "/") }
+        if let inner {
             a.status = .failed
             a.error = "it contains \(inner), which stays"
             stayed.append(a.target)
