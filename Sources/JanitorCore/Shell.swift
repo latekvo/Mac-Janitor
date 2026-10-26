@@ -17,7 +17,7 @@ public enum Shell {
         "/usr/bin", "/bin", "/usr/sbin", "/sbin",
     ].joined(separator: ":")
 
-    /// Runs `args[0]` looked up on `path`. Exit status 124 means it was killed at `timeout`.
+    /// Runs `args[0]` looked up on `path`. Exit status 124 means it ran past `timeout`.
     @discardableResult
     public static func run(_ args: [String], cwd: String? = nil, timeout: TimeInterval = 120) -> ShellResult {
         let p = Process()
@@ -42,14 +42,23 @@ public enum Shell {
         group.enter()
         DispatchQueue.global().async { errData = err.fileHandleForReading.readDataToEndOfFile(); group.leave() }
 
+        let exited = DispatchSemaphore(value: 0)
+        p.terminationHandler = { _ in exited.signal() }
         do { try p.run() } catch {
             return ShellResult(status: 127, stdout: "", stderr: "\(args[0]): \(error.localizedDescription)")
         }
-        let timer = DispatchWorkItem { if p.isRunning { p.terminate() } }
-        DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timer)
-        p.waitUntilExit()
-        timer.cancel()
-        group.wait()
+        let deadline = DispatchTime.now() + timeout
+        var done = exited.wait(timeout: deadline) == .success
+        if !done {
+            p.terminate()
+            done = exited.wait(timeout: deadline + 5) == .success
+        }
+        // A child blocked in the kernel (on a stalled mount, say) ignores signals until the
+        // call returns, and a grandchild can hold the pipes open; leave either behind.
+        guard done, group.wait(timeout: deadline + 5) == .success else {
+            if !done { kill(p.processIdentifier, SIGKILL) }
+            return ShellResult(status: 124, stdout: "", stderr: "timed out after \(Int(timeout))s")
+        }
         let timedOut = p.terminationReason == .uncaughtSignal && p.terminationStatus == SIGTERM
         return ShellResult(
             status: timedOut ? 124 : p.terminationStatus,

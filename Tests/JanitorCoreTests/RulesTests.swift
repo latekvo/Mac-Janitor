@@ -162,6 +162,22 @@ final class RulesTests: XCTestCase {
         XCTAssertEqual(logged, ["removed salvage \(dir)/old.patch"])
     }
 
+    func testLsofNeverStatsSoAStalledMountCannotHangIt() {
+        XCTAssertEqual(Guards.lsofArgs, ["lsof", "-n", "-b", "-w", "-Fn"])
+    }
+
+    func testTimeoutReturnsEvenWhenTheChildWillNotDie() {
+        let start = Date()
+        XCTAssertEqual(Shell.run(["sh", "-c", "trap '' TERM; sleep 20"], timeout: 1).status, 124)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+    }
+
+    func testTimeoutReturnsEvenWhenAGrandchildHoldsThePipes() {
+        let start = Date()
+        XCTAssertEqual(Shell.run(["sh", "-c", "sleep 20 & exit 0"], timeout: 1).status, 124)
+        XCTAssertLessThan(Date().timeIntervalSince(start), 10)
+    }
+
     func testMissingToolIsToldApartFromAFailingOne() {
         XCTAssertTrue(Shell.run(["janitor-no-such-tool"]).notFound)
         XCTAssertFalse(Shell.run(["false"]).notFound)
