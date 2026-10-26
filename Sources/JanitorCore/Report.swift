@@ -132,7 +132,9 @@ public enum Paths {
 
 public func freeDiskBytes() -> Int64 {
     // What `df` reports; the "important usage" figure adds purgeable space that
-    // macOS may never actually hand back.
-    let values = try? Paths.home.resourceValues(forKeys: [.volumeAvailableCapacityKey])
-    return Int64(values?.volumeAvailableCapacity ?? 0)
+    // macOS may never actually hand back. Not URL.resourceValues: a URL caches them
+    // until its run loop turns, which the CLI's never does.
+    var st = statfs()
+    guard statfs(Paths.home.path, &st) == 0 else { return 0 }
+    return Int64(st.f_bavail) * Int64(st.f_bsize)
 }

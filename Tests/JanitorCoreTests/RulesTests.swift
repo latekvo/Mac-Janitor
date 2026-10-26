@@ -178,6 +178,14 @@ final class RulesTests: XCTestCase {
         XCTAssertLessThan(Date().timeIntervalSince(start), 10)
     }
 
+    func testFreeSpaceIsReadAfreshEachTime() throws {
+        let before = freeDiskBytes()
+        let file = Paths.home.appendingPathComponent(".janitor-free-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(at: file) }
+        try Data(count: 64_000_000).write(to: file)
+        XCTAssertNotEqual(freeDiskBytes(), before)
+    }
+
     func testMissingToolIsToldApartFromAFailingOne() {
         XCTAssertTrue(Shell.run(["janitor-no-such-tool"]).notFound)
         XCTAssertFalse(Shell.run(["false"]).notFound)
