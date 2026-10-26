@@ -36,10 +36,10 @@ enum DockerJanitor {
         // Dry runs overlap each other and a real run; without this one's write drops another's.
         let seenLock = open(Paths.dockerSeen.path + ".lock", O_CREAT | O_RDWR, 0o644)
         if seenLock >= 0 { flock(seenLock, LOCK_EX) }
-        defer { if seenLock >= 0 { close(seenLock) } }
         let previous = (try? JSONDecoder.janitor.decode([String: Date].self, from: Data(contentsOf: Paths.dockerSeen))) ?? [:]
         let active = lastActive(previous: previous, images: imageIDs, inUse: inUse, now: now)
         try? JSONEncoder.janitor.encode(active).write(to: Paths.dockerSeen, options: .atomic)
+        if seenLock >= 0 { close(seenLock) }
         guard !imageIDs.isEmpty else { return [] }
 
         let r = Shell.run(["docker", "image", "inspect", "--format", "{{.Id}}|{{.Size}}|{{join .RepoTags \",\"}}"] + imageIDs)
