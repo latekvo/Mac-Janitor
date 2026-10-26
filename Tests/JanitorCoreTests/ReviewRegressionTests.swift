@@ -251,6 +251,7 @@ final class ReviewRegressionTests: XCTestCase {
         backdate(copies + "-worktrees/old", days: 40)
 
         let j = WorktreeJanitor(cfg: cfg(protecting: [moved, copies]), guards: try Guards.gather())
+        XCTAssertEqual(j.repos, [copies, moved])
         XCTAssertEqual(j.disconnected, [w: moved])
         XCTAssertEqual(j.orphans, [orphan])
         XCTAssertEqual(j.plan().map(\.action.target), [])
@@ -288,8 +289,39 @@ final class ReviewRegressionTests: XCTestCase {
         let results = j.plan().filter { $0.action.target.hasPrefix(outer) }.map(j.execute)
         XCTAssertEqual(results.map(\.target), [inner, outer])
         XCTAssertEqual(results.map(\.status), [.failed, .failed])
-        XCTAssertEqual(results[1].error, "it contains \(inner), which stays")
+        XCTAssertEqual(results.last?.error, "it contains \(inner), which stays")
         XCTAssertTrue(FS.exists(outer + "/a.txt"))
+    }
+
+    func testCopiedRepoMountsAndRepeatedIdsLeaveWorktreesAlone() throws {
+        // A copy of a repo holds stale records of the original's worktree.
+        let a = try makeRepo("a")
+        let w = a + "-worktrees/w"
+        addWT(a, w)
+        try FileManager.default.copyItem(atPath: a, toPath: root + "/a2")
+        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "local"], cwd: w)
+        age(a, w, days: 2)
+        // A volume mounted in an abandoned plain copy.
+        let copy = a + "-worktrees/copy", volume = copy + "/vol", dmg = root + "/v.dmg"
+        try write(copy + "/a.txt", "x")
+        sh(["hdiutil", "create", "-quiet", "-size", "2m", "-fs", "APFS", "-volname", "v", dmg], cwd: root)
+        sh(["hdiutil", "attach", "-quiet", "-nobrowse", "-mountpoint", volume, dmg], cwd: root)
+        defer { Shell.run(["hdiutil", "detach", "-quiet", "-force", volume]) }
+        try write(volume + "/precious.txt", "x")
+        backdate(copy, days: 40)
+        try write(volume + "/fresh.txt", "x")
+        // A gone repo's worktree whose id a live worktree of `a` also uses.
+        let gone = try makeRepo("gone")
+        let orphan = root + "/elsewhere/w"
+        addWT(gone, orphan)
+        try FileManager.default.removeItem(atPath: gone + "/.git")
+
+        let j = WorktreeJanitor(cfg: cfg(protecting: [a, root + "/a2", gone]), guards: try Guards.gather())
+        XCTAssertEqual(j.orphans, [orphan])
+        XCTAssertEqual(j.disconnected, [:])
+        XCTAssertEqual(j.plan().map(\.action.target), [])
+        let reasons = Dictionary(uniqueKeysWithValues: j.skips.map { ($0.target, $0.reason) })
+        XCTAssertEqual(reasons[copy], "abandoned: untouched for 40.0 days, but a volume is mounted at \(volume)")
     }
 
     func testNonUTF8EditsSalvageByteForByte() throws {

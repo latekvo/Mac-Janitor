@@ -126,6 +126,8 @@ final class WorktreeJanitor {
     var skips: [Skip] = []
     /// Targets left in place this run, which their containers must not take with them.
     var stayed: [String] = []
+    /// Never walked into or removed with a folder: a stalled one hangs, a live one holds data.
+    let mounts = FS.mountPoints()
 
     init(cfg: Config, guards: Guards, only: Set<String>? = nil) {
         self.cfg = cfg
@@ -175,13 +177,15 @@ final class WorktreeJanitor {
         let root = FS.canonical(FS.normalize(root))
         var d = Discovery()
         var unreadable: [(checkout: String, id: String)] = []
-        FS.walk(root, skipping: FS.mountPoints().union([root + "/Library", root + "/.Trash"])) { path, name, _, _ in
+        FS.walk(root, skipping: FS.mountPoints().union([root + "/Library", root + "/.Trash"])) { path, name, st, _ in
             if name == "node_modules" { return false }
             guard name == ".git" else { return true }
             let checkout = (path as NSString).deletingLastPathComponent
             if hasGitDirectory(checkout) {
                 d.checkouts.insert(checkout)
-                if FS.isDirectory(path + "/worktrees") || FS.isDirectory(Self.root(checkout)) { d.repos.append(checkout) }
+                // A `.git` symlink borrows another repo, which is found where it lives.
+                if st.st_mode & S_IFMT == S_IFDIR,
+                   FS.isDirectory(path + "/worktrees") || FS.isDirectory(Self.root(checkout)) { d.repos.append(checkout) }
             } else if let dir = gitdir(of: checkout), isWorktreeGitdir(dir) {
                 d.checkouts.insert(checkout)
                 if !FS.exists(dir) { unreadable.append((checkout, (dir as NSString).lastPathComponent)) }
@@ -193,7 +197,14 @@ final class WorktreeJanitor {
         // reconnects. The rest may only sit where this run cannot read (a protected
         // folder, an unmounted drive), so an orphan is never removed whole.
         for (checkout, id) in unreadable {
-            if let repo = d.repos.first(where: { FS.isDirectory($0 + "/.git/worktrees/" + id) }) {
+            // Ids repeat across repos: the record must itself be lost, or point here.
+            let holder = d.repos.first { repo in
+                guard let text = try? String(contentsOfFile: repo + "/.git/worktrees/" + id + "/gitdir", encoding: .utf8)
+                else { return false }
+                let target = text.trimmingCharacters(in: .whitespacesAndNewlines)
+                return !FS.exists(target) || FS.canonical(target) == checkout + "/.git"
+            }
+            if let repo = holder {
                 d.disconnected[checkout] = repo
             } else {
                 d.orphans.append(checkout)
@@ -270,7 +281,7 @@ final class WorktreeJanitor {
     func scanTree(_ root: String, nested: Set<String>) -> (newest: Date?, nodeModules: [String]) {
         var newest: Date?
         var nodeModules: [String] = []
-        FS.walk(root) { path, name, st, _ in
+        FS.walk(root, skipping: mounts) { path, name, st, _ in
             let type = st.st_mode & S_IFMT
             if type == S_IFDIR && (name == ".git" || nested.contains(path)) { return false }
             if name == "node_modules" && (type == S_IFDIR || type == S_IFLNK) {
@@ -350,9 +361,16 @@ final class WorktreeJanitor {
             if origin.stdout.contains("github.com") { prs = fetchPRs(repo) }
         }
 
-        let registered = registeredWorktrees(repo).filter { FS.isDirectory($0.path) }
+        // A copy of a repo keeps records of the original's worktrees, with stale HEADs:
+        // only the repo a worktree's `.git` points into speaks for it. An unreadable
+        // `.git` proves nothing, and its failing salvage keeps it.
+        let all = registeredWorktrees(repo).filter { FS.isDirectory($0.path) }
+        let own = FS.canonical(repo + "/.git/worktrees")
+        let registered = all.filter { e in
+            Self.gitdir(of: e.path).map { FS.canonical(($0 as NSString).deletingLastPathComponent) == own } ?? true
+        }
         var paths: [(String, Entry?)] = registered.map { ($0.path, $0) }
-        let known = Set(registered.map(\.path))
+        let known = Set(all.map(\.path))
         let root = FS.canonical(Self.root(repo))
         for name in (try? FileManager.default.contentsOfDirectory(atPath: root)) ?? [] {
             let path = root + "/" + name
@@ -468,6 +486,8 @@ final class WorktreeJanitor {
             } else if let veto = guards.veto(c.action.target) ?? guards.veto(c.checkout) {
                 // A process in the worktree (a dev server writes nothing) still needs its packages.
                 skip(i, veto)
+            } else if let mount = mounts.first(where: { $0.hasPrefix(c.action.target + "/") }) {
+                skip(i, "a volume is mounted at \(mount)")
             } else if case .gitWorktree = c.kind, let lost = unsalvageable(c.action.target) {
                 skip(i, lost)
             }
