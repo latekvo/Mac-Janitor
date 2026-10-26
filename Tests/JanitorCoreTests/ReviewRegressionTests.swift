@@ -91,7 +91,7 @@ final class ReviewRegressionTests: XCTestCase {
         backdate(og, days: 40)
         let j = WorktreeJanitor(cfg: cfg(protecting: [repo]), guards: try Guards.gather())
         XCTAssertEqual(j.plan().map(\.action.target), [])
-        XCTAssertTrue(j.skips.contains { $0.target == outer && $0.reason.hasSuffix("it contains the worktree \(inner)") }, "\(j.skips)")
+        XCTAssertTrue(j.skips.contains { $0.target == outer && $0.reason.hasSuffix("it contains the checkout \(inner)") }, "\(j.skips)")
     }
 
     func testKeepingAChildOrASloppySpellingKeepsTheWorktree() throws {
@@ -208,6 +208,55 @@ final class ReviewRegressionTests: XCTestCase {
                        [inRoot, outside, copies + "-worktrees/snapshot"])
         // Without a remote there is nothing to fetch or ask GitHub about.
         XCTAssertEqual(j.issues.filter { $0.message.contains(local) }.map(\.message), [])
+    }
+
+    func testMovedReposWorktreesAndCheckoutsInsideOthersStay() throws {
+        // A repo moved with its worktrees inside: both sides of the link point at the old place.
+        let orig = try makeRepo("orig")
+        addWT(orig, orig + "/.claude/worktrees/w")
+        let moved = root + "/new"
+        try FileManager.default.moveItem(atPath: orig, toPath: moved)
+        let w = moved + "/.claude/worktrees/w"
+        backdate(w, days: 40)
+        // An orphan holding a clone with commits nowhere else.
+        let gone = try makeRepo("gone")
+        let orphan = root + "/elsewhere/o"
+        addWT(gone, orphan)
+        sh(["git", "init", "-q", orphan + "/vendor/lib"], cwd: root)
+        try FileManager.default.removeItem(atPath: gone + "/.git")
+        backdate(orphan, days: 40)
+        // A submodule of a gone worktree is not a worktree.
+        try write(root + "/subs/pkg/.git", "gitdir: \(root)/missing/.git/worktrees/x/modules/pkg\n")
+        // A copy whose `.git` links to a clone.
+        let copies = try makeRepo("copies")
+        try FileManager.default.createDirectory(atPath: copies + "-worktrees/linked", withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: copies + "-worktrees/linked/.git", withDestinationPath: copies + "/.git")
+        backdate(copies + "-worktrees/linked", days: 40)
+        // Merged and pushed, but git cannot read its status.
+        let broken = copies + "-worktrees/broken"
+        addWT(copies, broken)
+        let brokenRecord = try String(contentsOfFile: broken + "/.git", encoding: .utf8).dropFirst(8)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        try write(broken + "/.git", "garbage\n")
+        backdate(broken, days: 2)
+        backdate(brokenRecord, days: 2)
+        // A clone inside a plain copy: its packages are not the copy's.
+        let holder = copies + "-worktrees/holder"
+        sh(["git", "init", "-q", holder + "/inner"], cwd: root)
+        try write(holder + "/inner/node_modules/x/index.js", "x")
+        backdate(holder, days: 5)
+
+        let j = WorktreeJanitor(cfg: cfg(protecting: [moved, copies]), guards: try Guards.gather())
+        XCTAssertEqual(j.disconnected, [w: moved])
+        XCTAssertEqual(j.orphans, [orphan])
+        XCTAssertEqual(j.plan().map(\.action.target), [])
+        let reasons = Dictionary(uniqueKeysWithValues: j.skips.map { ($0.target, $0.reason) })
+        XCTAssertEqual(reasons[w], "untouched for 40 days, but it is disconnected from \(moved)")
+        XCTAssertEqual(reasons[orphan], "abandoned: untouched for 40.0 days, but it contains the checkout \(orphan)/vendor/lib")
+        XCTAssertEqual(reasons[copies + "-worktrees/linked"], "untouched for 40 days, but it is a git checkout of another repo")
+        XCTAssertNil(reasons[broken])
+        XCTAssertEqual(j.skips.filter { $0.target.hasPrefix(holder) }.map(\.target), [])
+        XCTAssertTrue(j.issues.contains { $0.message.hasPrefix("1 worktrees of \(moved) ") && $0.message.hasSuffix(w) }, "\(j.issues)")
     }
 
     func testNonUTF8EditsSalvageByteForByte() throws {

@@ -17,9 +17,11 @@ the settings.
 
 Worktrees are found by walking the home folder, skipping other volumes, `~/Library`,
 the Trash and `node_modules`: those registered with any repo there, plus plain copies in
-`<repo>-worktrees`. A worktree whose repo is gone (its `.git` file points nowhere)
-counts as a plain copy, which only the 30-day rule removes. The PR rules need a
-GitHub remote. The main checkout and branches are never removed.
+`<repo>-worktrees`. A worktree whose repo is gone (its `.git` file points nowhere
+and no repo holds its record) counts as a plain copy, which only the 30-day rule
+removes. One whose repo moved keeps its record there and is never removed whole;
+`git worktree repair` reconnects it. The PR rules need a GitHub remote. The main
+checkout and branches are never removed.
 
 "Untouched" is the newest file modification time in the worktree, ignoring
 `node_modules`, plus its git `HEAD` and `index`. Directory times are ignored, so
@@ -33,7 +35,7 @@ removing `node_modules` does not restart the clock.
 - A `node_modules` that another checkout's `node_modules` symlinks into, unless that
   checkout is itself idle or going (donor checkouts). Symlinked `node_modules` are
   never removed themselves: they free nothing.
-- A git checkout of some other repo sitting in a worktree folder.
+- A git checkout of some other repo sitting in a worktree folder, or anything containing a checkout.
 - Running emulators, and images used by any container, including Docker Desktop's own.
 
 Before a git worktree goes (plain copies get no salvage), uncommitted changes are saved as a patch, untracked files

@@ -85,9 +85,6 @@ public enum Janitor {
             record(dryRun ? a : AVDJanitor.execute(a, cfg))
         }
         for a in images where wanted(a) { record(dryRun ? a : DockerJanitor.execute(a)) }
-        if !dryRun && worktrees.contains(where: { $0.action.category == .worktree }) {
-            for repo in wt.repos { Shell.run(["git", "worktree", "prune"], cwd: repo) }
-        }
         if !dryRun && only == nil { pruneSalvage(cfg, now: started, log: log) }
         for s in skips { log("skip \(s.category.rawValue) \(s.target): \(s.reason)") }
         for i in issues { log("issue \(i.category.rawValue): \(i.message)") }

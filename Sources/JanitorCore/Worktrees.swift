@@ -118,6 +118,10 @@ final class WorktreeJanitor {
     let repos: [String]
     /// Worktrees whose repo is gone.
     let orphans: [String]
+    /// Worktrees whose repo moved, mapped to the repo still holding their record.
+    let disconnected: [String: String]
+    /// Every checkout found, so none is scanned or removed as part of another.
+    let checkouts: Set<String>
     var issues: [Issue] = []
     var skips: [Skip] = []
 
@@ -125,7 +129,9 @@ final class WorktreeJanitor {
         self.cfg = cfg
         self.guards = guards
         self.only = only
-        (repos, orphans) = Self.discover(under: cfg.worktreeSearchRoot)
+        let found = cfg.enabled(.worktree) || cfg.enabled(.nodeModules)
+            ? Self.discover(under: cfg.worktreeSearchRoot) : Discovery()
+        (repos, orphans, disconnected, checkouts) = (found.repos, found.orphans, found.disconnected, found.checkouts)
     }
 
     /// Where a repo's worktrees live: `~/dev/x` -> `~/dev/x-worktrees`.
@@ -139,32 +145,62 @@ final class WorktreeJanitor {
         return dir.hasPrefix("/") ? dir : FS.normalize(checkout + "/" + dir)
     }
 
+    /// A `.git` directory, followed through a symlink.
+    static func hasGitDirectory(_ checkout: String) -> Bool {
+        var isDir: ObjCBool = false
+        return FileManager.default.fileExists(atPath: checkout + "/.git", isDirectory: &isDir) && isDir.boolValue
+    }
+
     /// A checkout git can still read: a `.git` directory, or a `.git` file whose gitdir exists.
     static func isLiveCheckout(_ path: String) -> Bool {
-        FS.isDirectory(path + "/.git") || gitdir(of: path).map(FS.exists) == true
+        hasGitDirectory(path) || gitdir(of: path).map(FS.exists) == true
+    }
+
+    /// A linked worktree's gitdir is `<repo>/.git/worktrees/<id>`; a submodule's is not.
+    static func isWorktreeGitdir(_ dir: String) -> Bool {
+        (dir as NSString).deletingLastPathComponent.hasSuffix("/worktrees")
+    }
+
+    struct Discovery {
+        var repos: [String] = [], orphans: [String] = []
+        var disconnected: [String: String] = [:]
+        var checkouts: Set<String> = []
     }
 
     /// One walk of `root`, staying on its volume (a stalled share would hang it), skipping
-    /// `Library`, `.Trash` and node_modules and never entering a `.git`: the repos to
-    /// manage and the orphaned worktrees.
-    static func discover(under root: String) -> (repos: [String], orphans: [String]) {
+    /// `Library`, `.Trash` and node_modules and never entering a `.git`.
+    static func discover(under root: String) -> Discovery {
         let root = FS.canonical(FS.normalize(root))
         let volume = FS.lstatInfo(root)?.st_dev
-        var repos: [String] = [], orphans: [String] = []
+        var d = Discovery()
+        var unreadable: [(checkout: String, id: String)] = []
         FS.walk(root) { path, name, st, _ in
             if st.st_dev != volume || name == "node_modules" || path == root + "/Library" || path == root + "/.Trash" {
                 return false
             }
             guard name == ".git" else { return true }
             let checkout = (path as NSString).deletingLastPathComponent
-            if st.st_mode & S_IFMT == S_IFDIR {
-                if FS.isDirectory(path + "/worktrees") || FS.isDirectory(Self.root(checkout)) { repos.append(checkout) }
-            } else if let dir = gitdir(of: checkout), dir.contains("/worktrees/"), !FS.exists(dir) {
-                orphans.append(checkout)
+            if hasGitDirectory(checkout) {
+                d.checkouts.insert(checkout)
+                if FS.isDirectory(path + "/worktrees") || FS.isDirectory(Self.root(checkout)) { d.repos.append(checkout) }
+            } else if let dir = gitdir(of: checkout), isWorktreeGitdir(dir) {
+                d.checkouts.insert(checkout)
+                if !FS.exists(dir) { unreadable.append((checkout, (dir as NSString).lastPathComponent)) }
             }
             return false
         }
-        return (repos.sorted(), orphans.sorted())
+        d.repos.sort()
+        // A moved repo still holds its worktrees' records, which `git worktree repair`
+        // reconnects: only a worktree no repo holds is an orphan.
+        for (checkout, id) in unreadable {
+            if let repo = d.repos.first(where: { FS.isDirectory($0 + "/.git/worktrees/" + id) }) {
+                d.disconnected[checkout] = repo
+            } else {
+                d.orphans.append(checkout)
+            }
+        }
+        d.orphans.sort()
+        return d
     }
 
     @discardableResult
@@ -262,8 +298,9 @@ final class WorktreeJanitor {
     func addGitFacts(_ f: inout WorktreeFacts, _ e: Entry, repo: String, mainRef: String, prs: [PRInfo]) {
         guard let head = e.head else { return }
         // Untracked files count: work never added is still work.
-        f.dirty = !git(["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=all"], cwd: e.path)
-            .stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        // A status git cannot read is not a clean one.
+        let status = git(["status", "--porcelain", "--untracked-files=normal", "--ignore-submodules=all"], cwd: e.path)
+        f.dirty = !status.ok || !status.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         let unpushed = git(["rev-list", "-n1", head, "--not", "--remotes"], cwd: repo)
         f.headOnRemote = unpushed.ok && unpushed.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
         f.mergedIntoMain = git(["merge-base", "--is-ancestor", head, mainRef], cwd: repo).ok
@@ -321,7 +358,7 @@ final class WorktreeJanitor {
             let path = root + "/" + name
             if FS.isDirectory(path) && !known.contains(path) { paths.append((path, nil)) }
         }
-        let nested = Set(paths.map(\.0)).union(orphans)
+        let nested = Set(paths.map(\.0)).union(checkouts)
 
         var checkouts: [Checkout] = []
         var links: [NodeLink] = []
@@ -360,19 +397,29 @@ final class WorktreeJanitor {
             checkouts += s.checkouts
             links += s.links
         }
-        // Orphans in a `<repo>-worktrees` folder were already found as plain copies.
+        // Those in a `<repo>-worktrees` folder were already found as plain copies.
         let seen = Set(checkouts.map(\.facts.path))
-        let nested = Set(orphans).union(seen)
-        for path in orphans where !seen.contains(path) {
+        let nested = self.checkouts.union(seen)
+        for path in orphans + disconnected.keys.sorted() where !seen.contains(path) {
             let c = checkout(path, entry: nil, repo: "", nested: nested)
             checkouts.append(c)
             links += c.nodeModules.flatMap { self.links(checkout: path, nodeModules: $0) }
         }
 
+        for (repo, moved) in Dictionary(grouping: disconnected.keys, by: { disconnected[$0]! }).sorted(by: { $0.key < $1.key }) {
+            issues.append(Issue(.worktree, "\(moved.count) worktrees of \(repo) lost their link to it in a move and are never removed "
+                                + "whole until `git -C \(repo) worktree repair <paths>` reconnects them, e.g. \(moved.sorted()[0])"))
+        }
+
         var candidates: [Candidate] = []
         for c in checkouts {
             let f = c.facts
-            if !f.isGit && Self.isLiveCheckout(f.path) {
+            if let repo = disconnected[f.path] {
+                if cfg.enabled(.worktree) && f.idleDays > cfg.abandonedIdleDays {
+                    skips.append(Skip(category: .worktree, target: f.path,
+                                      reason: "untouched for \(Int(f.idleDays)) days, but it is disconnected from \(repo)"))
+                }
+            } else if !f.isGit && Self.isLiveCheckout(f.path) {
                 // Some other repo's checkout: its unpushed work is invisible from here.
                 if cfg.enabled(.worktree) && f.idleDays > cfg.abandonedIdleDays {
                     skips.append(Skip(category: .worktree, target: f.path,
@@ -419,7 +466,7 @@ final class WorktreeJanitor {
         // A donor's packages must outlive every checkout still linking into them,
         // including through links inside the donor (workspace packages), and a
         // worktree must outlive the worktrees nested in it.
-        let allCheckouts = checkouts.map(\.facts.path) + repos
+        let allCheckouts = checkouts.map(\.facts.path) + self.checkouts
         var changed = true
         while changed {
             changed = false
@@ -441,7 +488,7 @@ final class WorktreeJanitor {
                     skip(i, "\(holder) links into it")
                     changed = true
                 } else if let inner = allCheckouts.first(where: { $0.hasPrefix(t + "/") && !gone.contains($0) }) {
-                    skip(i, "it contains the worktree \(inner)")
+                    skip(i, "it contains the checkout \(inner)")
                     changed = true
                 }
             }
@@ -480,10 +527,12 @@ final class WorktreeJanitor {
             case .gitWorktree(let repo, let head):
                 a.salvage = try salvage(a.target, head: head, repo: repo)
                 try Safety.check(a.target)
+                let record = Self.gitdir(of: a.target)
                 let r = git(["worktree", "remove", "--force", "--force", a.target], cwd: repo)
                 if !r.ok {
                     try FS.remove(a.target)
-                    git(["worktree", "prune"], cwd: repo)
+                    // Only this record: `git worktree prune` would also drop moved worktrees' records.
+                    if let record, Self.isWorktreeGitdir(record), FS.exists(record) { try FS.remove(record) }
                 }
             }
             a.status = .removed
