@@ -77,7 +77,11 @@ public enum Janitor {
             skips.append(Skip(category: a.category, target: a.target, reason: "\(a.reason), but \(veto)"))
             return false
         }
-        for c in worktrees where wanted(c.action) && stillFree(c.action, c.action.target, c.checkout) {
+        for c in worktrees {
+            guard wanted(c.action) && stillFree(c.action, c.action.target, c.checkout) else {
+                wt.stayed.append(c.action.target)
+                continue
+            }
             record(dryRun ? c.action : wt.execute(c))
         }
         for a in scratch where wanted(a) && stillFree(a, a.target) { record(dryRun ? a : ScratchpadJanitor.execute(a)) }

@@ -116,7 +116,7 @@ final class WorktreeJanitor {
     let now = Date()
     /// Main checkouts with linked worktrees or a `<repo>-worktrees` folder.
     let repos: [String]
-    /// Worktrees whose repo is gone.
+    /// Worktrees whose repo is gone, or out of this run's reach.
     let orphans: [String]
     /// Worktrees whose repo moved, mapped to the repo still holding their record.
     let disconnected: [String: String]
@@ -124,6 +124,8 @@ final class WorktreeJanitor {
     let checkouts: Set<String>
     var issues: [Issue] = []
     var skips: [Skip] = []
+    /// Targets left in place this run, which their containers must not take with them.
+    var stayed: [String] = []
 
     init(cfg: Config, guards: Guards, only: Set<String>? = nil) {
         self.cfg = cfg
@@ -167,17 +169,14 @@ final class WorktreeJanitor {
         var checkouts: Set<String> = []
     }
 
-    /// One walk of `root`, staying on its volume (a stalled share would hang it), skipping
-    /// `Library`, `.Trash` and node_modules and never entering a `.git`.
+    /// One walk of `root`, never touching another volume (a stalled share would hang it),
+    /// skipping `Library`, `.Trash` and node_modules and never entering a `.git`.
     static func discover(under root: String) -> Discovery {
         let root = FS.canonical(FS.normalize(root))
-        let volume = FS.lstatInfo(root)?.st_dev
         var d = Discovery()
         var unreadable: [(checkout: String, id: String)] = []
-        FS.walk(root) { path, name, st, _ in
-            if st.st_dev != volume || name == "node_modules" || path == root + "/Library" || path == root + "/.Trash" {
-                return false
-            }
+        FS.walk(root, skipping: FS.mountPoints().union([root + "/Library", root + "/.Trash"])) { path, name, _, _ in
+            if name == "node_modules" { return false }
             guard name == ".git" else { return true }
             let checkout = (path as NSString).deletingLastPathComponent
             if hasGitDirectory(checkout) {
@@ -191,7 +190,8 @@ final class WorktreeJanitor {
         }
         d.repos.sort()
         // A moved repo still holds its worktrees' records, which `git worktree repair`
-        // reconnects: only a worktree no repo holds is an orphan.
+        // reconnects. The rest may only sit where this run cannot read (a protected
+        // folder, an unmounted drive), so an orphan is never removed whole.
         for (checkout, id) in unreadable {
             if let repo = d.repos.first(where: { FS.isDirectory($0 + "/.git/worktrees/" + id) }) {
                 d.disconnected[checkout] = repo
@@ -411,10 +411,20 @@ final class WorktreeJanitor {
                                 + "whole until `git -C \(repo) worktree repair <paths>` reconnects them, e.g. \(moved.sorted()[0])"))
         }
 
+        // A worktree of one repo in another's `-worktrees` folder was found by both.
+        let gitPaths = Set(checkouts.filter(\.facts.isGit).map(\.facts.path))
+        checkouts.removeAll { !$0.facts.isGit && gitPaths.contains($0.facts.path) }
+        let orphaned = Set(orphans)
+
         var candidates: [Candidate] = []
         for c in checkouts {
             let f = c.facts
-            if let repo = disconnected[f.path] {
+            if orphaned.contains(f.path) {
+                if cfg.enabled(.worktree) && f.idleDays > cfg.abandonedIdleDays {
+                    skips.append(Skip(category: .worktree, target: f.path,
+                                      reason: "untouched for \(Int(f.idleDays)) days, but no repo found holds this worktree"))
+                }
+            } else if let repo = disconnected[f.path] {
                 if cfg.enabled(.worktree) && f.idleDays > cfg.abandonedIdleDays {
                     skips.append(Skip(category: .worktree, target: f.path,
                                       reason: "untouched for \(Int(f.idleDays)) days, but it is disconnected from \(repo)"))
@@ -494,12 +504,13 @@ final class WorktreeJanitor {
             }
         }
 
+        // Nested targets first, so a failure inside stops its container (see `stayed`).
         return candidates.indices.compactMap { i -> Candidate? in
             guard planned[i], candidates[i].kind != .link else { return nil }
             var c = candidates[i]
             c.action.bytes = FS.allocatedSize(c.action.target)
             return c
-        }
+        }.sorted { $0.action.target.count > $1.action.target.count }
     }
 
     static let salvageCap: Int64 = 50_000_000
@@ -520,6 +531,12 @@ final class WorktreeJanitor {
 
     func execute(_ c: Candidate) -> Action {
         var a = c.action
+        if let inner = stayed.first(where: { $0.hasPrefix(a.target + "/") }) {
+            a.status = .failed
+            a.error = "it contains \(inner), which stays"
+            stayed.append(a.target)
+            return a
+        }
         do {
             switch c.kind {
             case .plainDirectory, .link:
@@ -539,6 +556,7 @@ final class WorktreeJanitor {
         } catch {
             a.status = .failed
             a.error = "\(error)"
+            stayed.append(a.target)
         }
         return a
     }

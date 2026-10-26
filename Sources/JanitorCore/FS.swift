@@ -31,20 +31,32 @@ public enum FS {
     }
 
     /// Depth-first walk that never follows symlinks. `visit` returns false to
-    /// skip a directory's contents; `stop` set to true ends the walk.
-    static func walk(_ root: String, _ visit: (_ path: String, _ name: String, _ st: stat, _ stop: inout Bool) -> Bool) {
+    /// skip a directory's contents; `stop` set to true ends the walk. Paths in
+    /// `skipping` are not even stat'ed.
+    static func walk(_ root: String, skipping: Set<String> = [],
+                     _ visit: (_ path: String, _ name: String, _ st: stat, _ stop: inout Bool) -> Bool) {
         var stack = [root]
         var stop = false
         while let dir = stack.popLast(), !stop {
             guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
             for name in names {
                 let path = dir + "/" + name
-                guard let st = lstatInfo(path) else { continue }
+                guard !skipping.contains(path), let st = lstatInfo(path) else { continue }
                 let descend = visit(path, name, st, &stop)
                 if stop { return }
                 if descend && st.st_mode & S_IFMT == S_IFDIR { stack.append(path) }
             }
         }
+    }
+
+    /// Where every volume is mounted, read from the kernel's cached list (no mount is asked).
+    static func mountPoints() -> Set<String> {
+        var list: UnsafeMutablePointer<statfs>?
+        let n = Int(getmntinfo(&list, MNT_NOWAIT))
+        guard n > 0, let list else { return [] }
+        return Set((0..<n).map { i in
+            withUnsafeBytes(of: list[i].f_mntonname) { String(cString: $0.bindMemory(to: CChar.self).baseAddress!) }
+        })
     }
 
     /// Newest modification time of `root` and everything under it. With

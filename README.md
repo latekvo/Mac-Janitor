@@ -15,13 +15,12 @@ the settings.
 | Android emulators (AVDs) | unused for 7 days |
 | Claude Code scratchpads (`/private/tmp/claude-<uid>/<project>/<session>`) | untouched for 14 days |
 
-Worktrees are found by walking the home folder, skipping other volumes, `~/Library`,
+Worktrees are found by walking the home folder, skipping mounted volumes, `~/Library`,
 the Trash and `node_modules`: those registered with any repo there, plus plain copies in
-`<repo>-worktrees`. A worktree whose repo is gone (its `.git` file points nowhere
-and no repo holds its record) counts as a plain copy, which only the 30-day rule
-removes. One whose repo moved keeps its record there and is never removed whole;
-`git worktree repair` reconnects it. The PR rules need a GitHub remote. The main
-checkout and branches are never removed.
+`<repo>-worktrees`. A worktree whose `.git` file points nowhere is never removed
+whole, only its `node_modules`: its repo may have moved (the run reports the
+`git worktree repair` that reconnects it) or sit where the run cannot read. The PR
+rules need a GitHub remote. The main checkout and branches are never removed.
 
 "Untouched" is the newest file modification time in the worktree, ignoring
 `node_modules`, plus its git `HEAD` and `index`. Directory times are ignored, so

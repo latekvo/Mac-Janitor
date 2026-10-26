@@ -194,6 +194,7 @@ final class ReviewRegressionTests: XCTestCase {
         backdate(copies + "-worktrees/snapshot", days: 40)
         try FileManager.default.removeItem(atPath: moved + "/.git")
         for p in [inRoot, outside] { backdate(p, days: 40) }
+        try FileManager.default.createDirectory(atPath: root + "/Library/r/.git/worktrees", withIntermediateDirectories: true)
         // Another volume is not walked.
         let dmg = root + "/v.dmg", volume = root + "/volume"
         sh(["hdiutil", "create", "-quiet", "-size", "2m", "-fs", "APFS", "-volname", "v", dmg], cwd: root)
@@ -204,8 +205,9 @@ final class ReviewRegressionTests: XCTestCase {
         let j = WorktreeJanitor(cfg: cfg(protecting: [claude, copies, sibling, plain, local]), guards: try Guards.gather())
         XCTAssertEqual(j.repos, [claude, copies, local, sibling])
         XCTAssertEqual(j.orphans, [inRoot, outside].sorted())
-        XCTAssertEqual(Set(j.plan().filter { $0.action.category == .worktree }.map(\.action.target)),
-                       [inRoot, outside, copies + "-worktrees/snapshot"])
+        XCTAssertEqual(j.plan().filter { $0.action.category == .worktree }.map(\.action.target), [copies + "-worktrees/snapshot"])
+        // Never removed whole: their repo may only be out of reach.
+        XCTAssertEqual(j.skips.filter { [inRoot, outside].contains($0.target) }.map(\.target).sorted(), [inRoot, outside].sorted())
         // Without a remote there is nothing to fetch or ask GitHub about.
         XCTAssertEqual(j.issues.filter { $0.message.contains(local) }.map(\.message), [])
     }
@@ -245,6 +247,8 @@ final class ReviewRegressionTests: XCTestCase {
         sh(["git", "init", "-q", holder + "/inner"], cwd: root)
         try write(holder + "/inner/node_modules/x/index.js", "x")
         backdate(holder, days: 5)
+        sh(["git", "init", "-q", copies + "-worktrees/old/lib"], cwd: root)
+        backdate(copies + "-worktrees/old", days: 40)
 
         let j = WorktreeJanitor(cfg: cfg(protecting: [moved, copies]), guards: try Guards.gather())
         XCTAssertEqual(j.disconnected, [w: moved])
@@ -252,11 +256,40 @@ final class ReviewRegressionTests: XCTestCase {
         XCTAssertEqual(j.plan().map(\.action.target), [])
         let reasons = Dictionary(uniqueKeysWithValues: j.skips.map { ($0.target, $0.reason) })
         XCTAssertEqual(reasons[w], "untouched for 40 days, but it is disconnected from \(moved)")
-        XCTAssertEqual(reasons[orphan], "abandoned: untouched for 40.0 days, but it contains the checkout \(orphan)/vendor/lib")
+        XCTAssertEqual(reasons[orphan], "untouched for 40 days, but no repo found holds this worktree")
+        XCTAssertEqual(reasons[copies + "-worktrees/old"], "abandoned: untouched for 40.0 days, but it contains the checkout \(copies)-worktrees/old/lib")
         XCTAssertEqual(reasons[copies + "-worktrees/linked"], "untouched for 40 days, but it is a git checkout of another repo")
         XCTAssertNil(reasons[broken])
         XCTAssertEqual(j.skips.filter { $0.target.hasPrefix(holder) }.map(\.target), [])
         XCTAssertTrue(j.issues.contains { $0.message.hasPrefix("1 worktrees of \(moved) ") && $0.message.hasSuffix(w) }, "\(j.issues)")
+    }
+
+    func testAFailureInsideStopsItsContainerAndCrossRepoWorktreesPlanOnce() throws {
+        let repo = try makeRepo("repo")
+        let outer = repo + "-worktrees/outer", inner = outer + "/sub"
+        try write(outer + "/a.txt", "x")
+        // Of a repo scanned after `repo`, so only the order of execution puts it first.
+        let late = try makeRepo("zz")
+        addWT(late, inner)
+        try write(inner + "/.git", "garbage\n")
+        backdate(outer, days: 40)
+        let other = try makeRepo("other")
+        let x = repo + "-worktrees/x"
+        addWT(other, x)
+        try write(x + "/node_modules/p/index.js", "x")
+        age(other, x, days: 5)
+
+        var c = cfg(protecting: [repo, other, late])
+        c.disabled = [.worktree]
+        XCTAssertEqual(WorktreeJanitor(cfg: c, guards: try Guards.gather()).plan().map(\.action.target), [x + "/node_modules"])
+
+        c.disabled = [.nodeModules]
+        let j = WorktreeJanitor(cfg: c, guards: try Guards.gather())
+        let results = j.plan().filter { $0.action.target.hasPrefix(outer) }.map(j.execute)
+        XCTAssertEqual(results.map(\.target), [inner, outer])
+        XCTAssertEqual(results.map(\.status), [.failed, .failed])
+        XCTAssertEqual(results[1].error, "it contains \(inner), which stays")
+        XCTAssertTrue(FS.exists(outer + "/a.txt"))
     }
 
     func testNonUTF8EditsSalvageByteForByte() throws {
