@@ -34,7 +34,10 @@ removing `node_modules` does not restart the clock.
 - A `node_modules` that another checkout's `node_modules` symlinks into, unless that
   checkout is itself idle or going (donor checkouts). Symlinked `node_modules` are
   never removed themselves: they free nothing.
-- A git checkout of some other repo sitting in a worktree folder, or anything containing a checkout.
+- A git checkout of some other repo sitting in a worktree folder, or anything containing a checkout
+  or a mounted volume.
+- A worktree whose submodules hold commits no remote has, changes or untracked files: they live in
+  the worktree's git dir and salvage cannot keep them.
 - Running emulators, and images used by any container, including Docker Desktop's own.
 
 Before a git worktree goes (plain copies get no salvage), uncommitted changes are saved as a patch, untracked files

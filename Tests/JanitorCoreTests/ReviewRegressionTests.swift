@@ -369,18 +369,33 @@ final class ReviewRegressionTests: XCTestCase {
 
     func testSubmoduleWorkAndCheckoutsBeyondTheSearchRootStay() throws {
         let sub = try makeRepo("sub"), sup = try makeRepo("sup")
-        sh(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "s"], cwd: sup)
-        sh(["git", "commit", "-q", "-m", "add s"], cwd: sup)
+        sh(["git", "-c", "protocol.file.allow=always", "submodule", "add", "-q", sub, "pkgs/s"], cwd: sup)
+        sh(["git", "commit", "-q", "-m", "add pkgs/s"], cwd: sup)
         sh(["git", "push", "-q", "origin", "main"], cwd: sup)
         let w = sup + "-worktrees/w"
         sh(["git", "worktree", "add", "-q", "--detach", w, "origin/main"], cwd: sup)
         sh(["git", "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"], cwd: w)
-        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "local"], cwd: w + "/s")
+        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q", "--allow-empty", "-m", "local"], cwd: w + "/pkgs/s")
         age(sup, w, days: 2)
         let clean = sup + "-worktrees/clean"
         sh(["git", "worktree", "add", "-q", "--detach", clean, "origin/main"], cwd: sup)
         sh(["git", "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"], cwd: clean)
         age(sup, clean, days: 2)
+        // Submodule work no status shows: committed into the gitlink, or stashed.
+        let commit = ["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "commit", "-q"]
+        let bumped = sup + "-worktrees/bumped", stashed = sup + "-worktrees/stashed", hidden = sup + "-worktrees/hidden"
+        for p in [bumped, stashed, hidden] {
+            sh(["git", "worktree", "add", "-q", "--detach", p, "origin/main"], cwd: sup)
+            sh(["git", "-c", "protocol.file.allow=always", "submodule", "update", "-q", "--init"], cwd: p)
+        }
+        sh(commit + ["--allow-empty", "-m", "sub"], cwd: bumped + "/pkgs/s")
+        sh(["git", "add", "pkgs/s"], cwd: bumped)
+        sh(commit + ["-m", "bump"], cwd: bumped)
+        try write(stashed + "/pkgs/s/a.txt", "changed\n")
+        sh(["git", "-c", "user.email=t@example.com", "-c", "user.name=t", "stash", "-q"], cwd: stashed + "/pkgs/s")
+        sh(["git", "config", "status.showUntrackedFiles", "no"], cwd: hidden + "/pkgs/s")
+        try write(hidden + "/pkgs/s/new.txt", "x")
+        for p in [bumped, stashed, hidden] { age(sup, p, days: 40) }
         let broken = sup + "-worktrees/broken"
         addWT(sup, broken)
         try write(broken + "/.git", "garbage\n")
@@ -391,13 +406,41 @@ final class ReviewRegressionTests: XCTestCase {
         addWT(sup, away)
         sh(["git", "init", "-q", away + "/clone"], cwd: root)
         age(sup, away, days: 40)
+        let away2 = away + "-2"
+        defer { try? FileManager.default.removeItem(atPath: away2) }
+        addWT(sup, away2)
+        try FileManager.default.createDirectory(atPath: away2 + "/linked", withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: away2 + "/linked/.git", withDestinationPath: sub + "/.git")
+        age(sup, away2, days: 40)
 
         let j = WorktreeJanitor(cfg: cfg(protecting: [sub, sup]), guards: try Guards.gather())
         XCTAssertEqual(j.plan().map(\.action.target), [clean])
         let reasons = Dictionary(uniqueKeysWithValues: j.skips.map { ($0.target, $0.reason) })
-        XCTAssertTrue(reasons[w]?.hasSuffix("but its submodule s has work salvage cannot keep") == true, "\(j.skips)")
+        XCTAssertTrue(reasons[w]?.hasSuffix("but its submodule pkgs/s has work salvage cannot keep") == true, "\(j.skips)")
         XCTAssertTrue(reasons[away]?.hasSuffix("but it contains the checkout \(away)/clone") == true, "\(j.skips)")
+        XCTAssertTrue(reasons[away2]?.hasSuffix("but it contains the checkout \(away2)/linked") == true, "\(j.skips)")
         XCTAssertTrue(reasons[broken]?.contains("but git status failed") == true, "\(j.skips)")
+        XCTAssertTrue(reasons[hidden]?.hasSuffix("but its submodule pkgs/s has work salvage cannot keep") == true, "\(j.skips)")
+        for p in [bumped, stashed] {
+            let dir = try XCTUnwrap(WorktreeJanitor.gitdir(of: p)) + "/modules/pkgs/s"
+            XCTAssertTrue(reasons[p]?.hasSuffix("but its submodule repo \(dir) holds commits no remote has") == true, "\(p): \(j.skips)")
+        }
+    }
+
+    func testALostWorktreeInASymlinkedWorktreeFolderStays() throws {
+        let repo = try makeRepo("ln")
+        let store = FS.canonical(FileManager.default.temporaryDirectory.path) + "/janitor-store-\(UUID().uuidString)"
+        defer { try? FileManager.default.removeItem(atPath: store) }
+        try FileManager.default.removeItem(atPath: repo + "-worktrees")
+        try FileManager.default.createDirectory(atPath: store, withIntermediateDirectories: true)
+        try FileManager.default.createSymbolicLink(atPath: repo + "-worktrees", withDestinationPath: store)
+        addWT(repo, store + "/x")
+        try FileManager.default.removeItem(atPath: repo + "/.git/worktrees/x")
+        backdate(store + "/x", days: 40)
+        let j = WorktreeJanitor(cfg: cfg(protecting: [repo]), guards: try Guards.gather())
+        XCTAssertEqual(j.repos, [repo])
+        XCTAssertEqual(j.plan().map(\.action.target), [])
+        XCTAssertEqual(j.skips.map(\.reason), ["untouched for 40 days, but no repo found holds this worktree"])
     }
 
     func testNonUTF8EditsSalvageByteForByte() throws {

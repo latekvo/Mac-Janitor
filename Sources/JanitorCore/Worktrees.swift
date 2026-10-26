@@ -160,6 +160,12 @@ final class WorktreeJanitor {
         hasGitDirectory(path) || gitdir(of: path).map(FS.exists) == true
     }
 
+    /// A worktree whose git dir is gone: found by discovery, or in a `-worktrees` folder
+    /// it never walked (a symlink to elsewhere).
+    static func isLostWorktree(_ path: String) -> Bool {
+        gitdir(of: path).map { isWorktreeGitdir($0) && !FS.exists($0) } == true
+    }
+
     /// A linked worktree's gitdir is `<repo>/.git/worktrees/<id>`; a submodule's is not.
     static func isWorktreeGitdir(_ dir: String) -> Bool {
         (dir as NSString).deletingLastPathComponent.hasSuffix("/worktrees")
@@ -288,7 +294,9 @@ final class WorktreeJanitor {
             // Checkouts discovery never reached, as under /tmp; a submodule is part of this one.
             if name == ".git" && path != root + "/.git" {
                 let checkout = (path as NSString).deletingLastPathComponent
-                if type == S_IFDIR || Self.gitdir(of: checkout).map(Self.isWorktreeGitdir) == true { inner.append(checkout) }
+                if Self.hasGitDirectory(checkout) || Self.gitdir(of: checkout).map(Self.isWorktreeGitdir) == true {
+                    inner.append(checkout)
+                }
             }
             if type == S_IFDIR && (name == ".git" || nested.contains(path)) { return false }
             if name == "node_modules" && (type == S_IFDIR || type == S_IFLNK) {
@@ -447,7 +455,7 @@ final class WorktreeJanitor {
         var candidates: [Candidate] = []
         for c in checkouts {
             let f = c.facts
-            if orphaned.contains(f.path) {
+            if disconnected[f.path] == nil && (orphaned.contains(f.path) || Self.isLostWorktree(f.path)) {
                 if cfg.enabled(.worktree) && f.idleDays > cfg.abandonedIdleDays {
                     skips.append(Skip(category: .worktree, target: f.path,
                                       reason: "untouched for \(Int(f.idleDays)) days, but no repo found holds this worktree"))
@@ -553,10 +561,30 @@ final class WorktreeJanitor {
     }
 
     /// Why removing this worktree would lose work salvage cannot keep, or nil.
+    /// The submodule repos in a git dir's `modules/`, nested ones included.
+    static func submoduleGitDirs(_ gitdir: String) -> [String] {
+        var found: [String] = []
+        var stack = [gitdir + "/modules"]
+        while let dir = stack.popLast() {
+            for name in (try? FileManager.default.contentsOfDirectory(atPath: dir)) ?? [] {
+                let path = dir + "/" + name
+                guard FS.isDirectory(path) else { continue }
+                // A name with slashes (`packages/x`) nests plain folders first.
+                if FS.isDirectory(path + "/objects") {
+                    found.append(path)
+                    stack.append(path + "/modules")
+                } else {
+                    stack.append(path)
+                }
+            }
+        }
+        return found
+    }
+
     func unsalvageable(_ path: String) -> String? {
         // A linked worktree's submodule repos live in its own git dir and go with it.
         // `S<c><m><u>`: new commits, changes or untracked files.
-        let status = git(["status", "--porcelain=v2", "--ignore-submodules=none"], cwd: path)
+        let status = git(["-c", "status.showUntrackedFiles=normal", "status", "--porcelain=v2", "--ignore-submodules=none"], cwd: path)
         guard status.ok else { return "git status failed: \(status.stderr)" }
         let busy = status.stdout.split(separator: "\n").compactMap { line -> String? in
             let f = line.split(separator: " ", maxSplits: 8)
@@ -564,6 +592,13 @@ final class WorktreeJanitor {
             return String(f[8])
         }
         if let sub = busy.first { return "its submodule \(sub) has work salvage cannot keep" }
+        // Commits a branch, stash or the superproject's gitlink holds show in no status.
+        for dir in Self.gitdir(of: path).map(Self.submoduleGitDirs) ?? [] {
+            let r = Shell.run(["git", "--git-dir=\(dir)", "rev-list", "-n1", "--all", "--not", "--remotes"])
+            if !r.ok || !r.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                return "its submodule repo \(dir) holds commits no remote has"
+            }
+        }
         let u = untracked(path)
         guard u.bytes > Self.salvageCap else { return nil }
         return "its \(u.files.count) untracked files (\(u.bytes / 1_000_000) MB) are too big to salvage"
