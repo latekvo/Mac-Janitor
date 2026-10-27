@@ -161,8 +161,8 @@ public enum FS {
 }
 
 extension FS {
-    /// Unlinks what `remove` deferred. Detached, it outlives this process and leaves
-    /// its stdio alone, so a caller reading this process's output is not held up.
+    /// Unlinks what `remove` deferred. Detached, it outlives this process and inherits
+    /// none of its descriptors: not the run lock, nor the stdout a caller reads to EOF.
     public static func purge(detached: Bool) {
         let entries = ((try? FileManager.default.contentsOfDirectory(atPath: purgeDir)) ?? []).map { purgeDir + "/" + $0 }
         guard !entries.isEmpty else { return }
@@ -173,7 +173,7 @@ extension FS {
         var attr: posix_spawnattr_t?
         posix_spawnattr_init(&attr)
         defer { posix_spawnattr_destroy(&attr) }
-        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID | POSIX_SPAWN_CLOEXEC_DEFAULT))
         var files: posix_spawn_file_actions_t?
         posix_spawn_file_actions_init(&files)
         defer { posix_spawn_file_actions_destroy(&files) }

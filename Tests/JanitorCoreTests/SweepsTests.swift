@@ -185,6 +185,25 @@ final class SweepsTests: XCTestCase {
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: FS.purgeDir), [])
     }
 
+    func testDetachedPurgeDoesNotHoldTheRunLock() throws {
+        let realPurge = FS.purgeDir
+        FS.purgeDir = root + "/purge"
+        defer { FS.purgeDir = realPurge }
+        // Enough files that rm is still at work once purge returns.
+        let tree = FS.purgeDir + "/tree"
+        try FileManager.default.createDirectory(atPath: tree, withIntermediateDirectories: true)
+        for i in 0..<2_000 { FileManager.default.createFile(atPath: "\(tree)/\(i)", contents: nil) }
+        let lockPath = root + "/run.lock"
+        let held = open(lockPath, O_CREAT | O_RDWR, 0o644)
+        XCTAssertEqual(flock(held, LOCK_EX | LOCK_NB), 0)
+        FS.purge(detached: true)
+        close(held)
+        XCTAssertTrue(FS.exists(tree), "rm finished before the lock could be probed")
+        let probe = open(lockPath, O_RDWR)
+        defer { close(probe) }
+        XCTAssertEqual(flock(probe, LOCK_EX | LOCK_NB), 0)
+    }
+
     func testOnlyPlansTheCategoriesItNames() throws {
         var cfg = Config()
         cfg.worktreeSearchRoot = root
