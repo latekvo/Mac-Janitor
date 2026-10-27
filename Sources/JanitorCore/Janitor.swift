@@ -61,10 +61,13 @@ public enum Janitor {
         let images = cfg.enabled(.dockerImage) ? DockerJanitor.plan(cfg, now: started, skips: &skips, issues: &issues) : []
 
         let searchRoot = FS.canonical(FS.normalize(cfg.worktreeSearchRoot))
-        let scan = cfg.enabled(.build) || cfg.enabled(.largeFile)
-            ? HomeScan.scan(searchRoot, skipping: Set([searchRoot + "/Library", FS.canonical(cfg.trashDir)] + cfg.cacheRoots.map(FS.canonical)),
-                            largeFileBytes: cfg.enabled(.largeFile) ? Int64(cfg.largeFileMinGB * 1e9) : nil)
-            : HomeScan()
+        let unscanned = Set([searchRoot + "/Library", FS.canonical(cfg.trashDir)] + cfg.cacheRoots.map(FS.canonical))
+        let largeFileBytes = cfg.enabled(.largeFile) ? Int64(cfg.largeFileMinGB * 1e9) : nil
+        let scan = !cfg.enabled(.build) && !cfg.enabled(.largeFile) ? HomeScan()
+            : only.map { ids in
+                HomeScan.named(ids.compactMap { id in id.firstIndex(of: ":").map { String(id[id.index(after: $0)...]) } },
+                               root: searchRoot, skipping: unscanned, largeFileBytes: largeFileBytes)
+            } ?? HomeScan.scan(searchRoot, skipping: unscanned, largeFileBytes: largeFileBytes)
         // Worktrees and their node_modules are the worktree rules' to judge, and a
         // worktree's node_modules may link into its repo's.
         let worktreeTargets = worktrees.map(\.action.target)

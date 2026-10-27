@@ -4,15 +4,18 @@ import Foundation
 func planPath(_ category: Category, _ target: String, reason: String, cfg: Config, guards: Guards,
               container: String? = nil, skips: inout [Skip]) -> Action? {
     if cfg.isKept(target) {
-        skips.append(Skip(category: category, target: target, reason: "kept", kept: true, bytes: FS.allocatedSize(target)))
+        skips.append(Skip(category: category, target: target, reason: "kept", kept: true, bytes: measure(target)))
         return nil
     }
     if let veto = guards.veto(target) ?? container.flatMap(guards.veto) {
         skips.append(Skip(category: category, target: target, reason: "\(reason), but \(veto)"))
         return nil
     }
-    return Action(category: category, target: target, reason: reason, bytes: FS.allocatedSize(target), status: .planned)
+    return Action(category: category, target: target, reason: reason, bytes: measure(target), status: .planned)
 }
+
+/// A clean acts on what a preview measured; measuring again walks every file it is about to skip.
+func measure(_ path: String) -> Int64 { FS.deferRemoval ? 0 : FS.allocatedSize(path) }
 
 func removePath(_ a: Action) -> Action {
     var a = a
@@ -89,7 +92,7 @@ enum CacheJanitor {
     }
 }
 
-/// One walk of the search root, finding build output and large files.
+/// One walk of the search root, finding build output in git checkouts and large files.
 struct HomeScan {
     /// Build or install output, and the project it belongs to.
     var artifacts: [(path: String, project: String)] = []
@@ -120,35 +123,69 @@ struct HomeScan {
         }
     }
 
-    /// Never descends into `.git`, an artifact, a mount or anything in `skipping`. Large
-    /// files are looked for only outside hidden folders and packages (apps, libraries).
+    /// What a walk finds at one entry: build output of the checkout `project`, a large
+    /// file, or a folder to walk into. Hidden folders and packages hold installed tools,
+    /// editor extensions and apps, whose `node_modules` no build regenerates.
+    enum Found { case artifact, largeFile, folder, nothing }
+
+    static func classify(_ path: String, _ st: stat, project: String?, largeFileBytes: Int64?) -> Found {
+        let name = (path as NSString).lastPathComponent
+        let ext = (name as NSString).pathExtension
+        switch st.st_mode & S_IFMT {
+        case S_IFDIR:
+            if project != nil && isArtifact(name, in: (path as NSString).deletingLastPathComponent) { return .artifact }
+            if name.hasPrefix(".") || name == "node_modules" { return .nothing }
+            let package = !ext.isEmpty && ((try? URL(fileURLWithPath: path).resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false)
+            return package ? .nothing : .folder
+        case S_IFREG:
+            guard let min = largeFileBytes, Int64(st.st_size) >= min, !partExtensions.contains(ext.lowercased()) else { return .nothing }
+            return .largeFile
+        default:
+            return .nothing
+        }
+    }
+
+    /// Walks visible folders, never into an artifact, a mount or anything in `skipping`.
     static func scan(_ root: String, skipping: Set<String>, largeFileBytes: Int64?) -> HomeScan {
         var result = HomeScan()
-        var stack: [(path: String, project: String?, visible: Bool)] = [(root, nil, true)]
+        var stack: [(path: String, project: String?)] = [(root, nil)]
         let skip = skipping.union(FS.mountPoints())
-        while let (dir, outer, visible) = stack.popLast() {
+        while let (dir, outer) = stack.popLast() {
             guard let names = try? FileManager.default.contentsOfDirectory(atPath: dir) else { continue }
             let project = names.contains(".git") ? dir : outer
-            for name in names where name != ".git" {
+            for name in names {
                 let path = dir + "/" + name
                 guard !skip.contains(path), let st = FS.lstatInfo(path) else { continue }
-                switch st.st_mode & S_IFMT {
-                case S_IFDIR:
-                    if isArtifact(name, in: dir) {
-                        result.artifacts.append((path, project ?? dir))
-                        continue
-                    }
-                    let ext = (name as NSString).pathExtension
-                    let package = !ext.isEmpty && ((try? URL(fileURLWithPath: path).resourceValues(forKeys: [.isPackageKey]))?.isPackage ?? false)
-                    stack.append((path, project, visible && !name.hasPrefix(".") && !package))
-                case S_IFREG:
-                    if visible, let min = largeFileBytes, Int64(st.st_size) >= min,
-                       !partExtensions.contains((name as NSString).pathExtension.lowercased()) {
-                        result.largeFiles.append(path)
-                    }
-                default:
-                    break
+                switch classify(path, st, project: project, largeFileBytes: largeFileBytes) {
+                case .artifact: result.artifacts.append((path, project!))
+                case .largeFile: result.largeFiles.append(path)
+                case .folder: stack.append((path, project))
+                case .nothing: break
                 }
+            }
+        }
+        return result
+    }
+
+    /// What `scan` would find among `paths`, without the walk: for a run that acts on
+    /// targets already planned by name.
+    static func named(_ paths: [String], root: String, skipping: Set<String>, largeFileBytes: Int64?) -> HomeScan {
+        var result = HomeScan()
+        let skip = skipping.union(FS.mountPoints())
+        for path in Set(paths) where path.hasPrefix(root + "/") {
+            // Every folder on the way down must be one `scan` walks into.
+            var dirs: [String] = []
+            var dir = (path as NSString).deletingLastPathComponent
+            while dir.count > root.count { dirs.append(dir); dir = (dir as NSString).deletingLastPathComponent }
+            guard dir == root, let st = FS.lstatInfo(path), !skip.contains(path),
+                  dirs.allSatisfy({ d in !skip.contains(d) && FS.lstatInfo(d).map {
+                      classify(d, $0, project: nil, largeFileBytes: nil) == .folder } == true })
+            else { continue }
+            let project = dirs.first { FS.exists($0 + "/.git") }
+            switch classify(path, st, project: project, largeFileBytes: largeFileBytes) {
+            case .artifact: result.artifacts.append((path, project!))
+            case .largeFile: result.largeFiles.append(path)
+            default: break
             }
         }
         return result

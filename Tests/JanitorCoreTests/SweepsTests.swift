@@ -68,13 +68,24 @@ final class SweepsTests: XCTestCase {
         _ = try make("idle/android/build.gradle")
         _ = try make("idle/android/build/out.apk")
         _ = try make("idle/docs/build/index.html")
+        _ = try make("busy/.git/HEAD", "ref: refs/heads/main")
         _ = try make("busy/package.json", "{}")
         _ = try make("busy/node_modules/a/index.js")
+        _ = try make("fresh-output/.git/HEAD", "ref: refs/heads/main")
         _ = try make("fresh-output/Cargo.toml")
         _ = try make("fresh-output/target/debug/bin")
+        _ = try make("owned/.git/HEAD", "ref: refs/heads/main")
         _ = try make("owned/package.json", "{}")
+        // Installed tools and editor extensions: no build makes these again.
+        _ = try make(".vscode/extensions/ext/.git/HEAD", "ref: refs/heads/main")
+        _ = try make(".vscode/extensions/ext/package.json", "{}")
+        _ = try make(".vscode/extensions/ext/node_modules/a/index.js")
+        _ = try make("loose/package.json", "{}")
+        _ = try make("loose/node_modules/a/index.js")
+        _ = try make("sdk/runtimes/node/lib/node_modules/npm/package.json", "{}")
+        _ = try make("sdk/runtimes/node/lib/node_modules/npm/node_modules/a/index.js")
         _ = try make("owned/node_modules/a/index.js")
-        for p in ["idle", "busy", "fresh-output", "owned"] { backdate(root + "/" + p, days: 20) }
+        for p in ["idle", "busy", "fresh-output", "owned", ".vscode", "sdk", "loose"] { backdate(root + "/" + p, days: 20) }
         _ = try make("busy/src/edited.js")
         _ = try make("fresh-output/target/debug/rebuilt")
 
@@ -82,6 +93,16 @@ final class SweepsTests: XCTestCase {
         // `docs/build` has no Gradle or Xcode project beside it.
         XCTAssertFalse(scan.artifacts.contains { $0.path.hasSuffix("docs/build") })
         XCTAssertEqual(Set(scan.artifacts.filter { $0.path.hasPrefix(root + "/idle/") }.map(\.project)), [root + "/idle"])
+        XCTAssertEqual(Set(scan.artifacts.map { String($0.path.dropFirst(root.count + 1)) }),
+                       ["idle/node_modules", "idle/android/build", "busy/node_modules", "fresh-output/target", "owned/node_modules"])
+        // A clean names its targets; the same rules apply without the walk.
+        let named = HomeScan.named(scan.artifacts.map(\.path) + [root + "/.vscode/extensions/ext/node_modules",
+                                                                  root + "/sdk/runtimes/node/lib/node_modules/npm/node_modules",
+                                                                  root + "/loose/node_modules", root + "/idle/docs/build"],
+                                   root: root, skipping: [], largeFileBytes: nil)
+        XCTAssertEqual(Set(named.artifacts.map(\.path)), Set(scan.artifacts.map(\.path)))
+        XCTAssertEqual(HomeScan.named([root + "/owned/node_modules"], root: root, skipping: [root + "/owned"],
+                                      largeFileBytes: nil).artifacts.count, 0)
 
         var skips: [Skip] = []
         let plan = BuildJanitor.plan(Config(), guards: none, now: Date(), scan: scan,
@@ -140,10 +161,21 @@ final class SweepsTests: XCTestCase {
         XCTAssertTrue(FS.exists(root + "/sdk/system-images/android-34/google_apis/arm64-v8a"))
     }
 
+    func testVetoFindsOpenFilesUnderAPathAmongSiblingsThatSortBetween() {
+        let g = Guards(openPaths: ["/a/b-c/f", "/a/b.d", "/a/b/deep/f", "/z"], launchAgentStrings: [])
+        XCTAssertEqual(g.veto("/a/b"), "in use (open: /a/b/deep/f)")
+        XCTAssertEqual(g.veto("/a/b.d"), "in use (open: /a/b.d)")
+        XCTAssertNil(g.veto("/a/b-"))
+        XCTAssertNil(g.veto("/a/bb"))
+        XCTAssertNil(g.veto("/zz"))
+    }
+
     func testDeferredRemovalRenamesNowAndPurgesLater() throws {
         _ = try make("doomed/a/b/file")
+        let realPurge = FS.purgeDir
+        FS.purgeDir = root + "/purge"
         FS.deferRemoval = true
-        defer { FS.deferRemoval = false }
+        defer { FS.deferRemoval = false; FS.purgeDir = realPurge }
         Safety.protectedPaths = []
         try FS.remove(root + "/doomed")
         XCTAssertFalse(FS.exists(root + "/doomed"))

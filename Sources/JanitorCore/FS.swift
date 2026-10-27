@@ -137,7 +137,7 @@ public enum FS {
 
     /// Removed paths wait here for `purge`. Unlinking a tree costs a metadata update per
     /// file, minutes for a big one; renaming it here, on the same volume, is one.
-    static var purgeDir: String { Paths.support.appendingPathComponent("purge").path }
+    static var purgeDir = Paths.support.appendingPathComponent("purge").path
 
     /// While set, `remove` renames into `purgeDir` and leaves the unlinking to `purge`.
     public static var deferRemoval = false

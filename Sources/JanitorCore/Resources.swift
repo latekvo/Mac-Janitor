@@ -88,7 +88,7 @@ enum AVDJanitor {
             guard age > cfg.avdUnusedDays else { continue }
             let reason = "unused for \(String(format: "%.1f", age)) days"
             if cfg.isKept(name) {
-                skips.append(Skip(category: .avd, target: name, reason: "kept", kept: true, bytes: FS.allocatedSize(dir)))
+                skips.append(Skip(category: .avd, target: name, reason: "kept", kept: true, bytes: measure(dir)))
                 continue
             }
             if running.contains("-avd \(name)") || running.contains("@\(name)") {
@@ -100,7 +100,7 @@ enum AVDJanitor {
                 continue
             }
             actions.append(Action(category: .avd, target: name, reason: reason,
-                                  bytes: FS.allocatedSize(dir), status: .planned))
+                                  bytes: measure(dir), status: .planned))
         }
         return actions + planImages(cfg, guards: guards, now: now, skips: &skips)
     }

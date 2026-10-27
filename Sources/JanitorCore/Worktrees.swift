@@ -500,7 +500,7 @@ final class WorktreeJanitor {
             let a = candidates[i].action
             guard candidates[i].kind != .link else { return }
             skips.append(Skip(category: a.category, target: a.target, reason: kept ? "kept" : "\(a.reason), but \(why)",
-                              kept: kept, bytes: kept ? FS.allocatedSize(a.target) : 0))
+                              kept: kept, bytes: kept ? measure(a.target) : 0))
         }
         for i in candidates.indices where planned[i] {
             let c = candidates[i]
@@ -551,7 +551,7 @@ final class WorktreeJanitor {
         return candidates.indices.compactMap { i -> Candidate? in
             guard planned[i], candidates[i].kind != .link else { return nil }
             var c = candidates[i]
-            c.action.bytes = FS.allocatedSize(c.action.target)
+            c.action.bytes = measure(c.action.target)
             return c
         }.sorted { $0.action.target.count > $1.action.target.count }
     }
