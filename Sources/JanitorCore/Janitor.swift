@@ -56,12 +56,18 @@ public enum Janitor {
         let worktrees = wt.plan()
         skips += wt.skips
         issues += wt.issues
+        if !Privacy.hasFullDiskAccess, let c = [Category.worktree, .nodeModules, .build, .largeFile].first(where: cfg.enabled),
+           Privacy.askingFolders.contains(where: { $0.hasPrefix(FS.canonical(FS.normalize(cfg.worktreeSearchRoot)) + "/") }) {
+            issues.append(Issue(c, "Desktop, Documents and Downloads are not searched; give janitor Full Disk Access "
+                                + "in System Settings > Privacy & Security"))
+        }
         let scratch = cfg.enabled(.scratchpad) ? ScratchpadJanitor.plan(cfg, guards: guards, now: started, skips: &skips) : []
         let avds = cfg.enabled(.avd) ? AVDJanitor.plan(cfg, guards: guards, now: started, skips: &skips) : []
         let images = cfg.enabled(.dockerImage) ? DockerJanitor.plan(cfg, now: started, skips: &skips, issues: &issues) : []
 
         let searchRoot = FS.canonical(FS.normalize(cfg.worktreeSearchRoot))
-        let unscanned = Set([searchRoot + "/Library", FS.canonical(cfg.trashDir)] + cfg.cacheRoots.map(FS.canonical))
+        let unscanned = Set([searchRoot + "/Library", FS.canonical(cfg.trashDir)] + cfg.cacheRoots.map(FS.canonical)
+                            + Privacy.unwalked())
         let largeFileBytes = cfg.enabled(.largeFile) ? Int64(cfg.largeFileMinGB * 1e9) : nil
         let scan = !cfg.enabled(.build) && !cfg.enabled(.largeFile) ? HomeScan()
             : only.map { ids in

@@ -181,12 +181,12 @@ final class WorktreeJanitor {
     }
 
     /// One walk of `root`, never touching another volume (a stalled share would hang it),
-    /// skipping `Library`, `.Trash` and node_modules and never entering a `.git`.
+    /// skipping `Library`, `.Trash`, node_modules and `Privacy.unwalked` and never entering a `.git`.
     static func discover(under root: String) -> Discovery {
         let root = FS.canonical(FS.normalize(root))
         var d = Discovery()
         var unreadable: [(checkout: String, id: String)] = []
-        FS.walk(root, skipping: FS.mountPoints().union([root + "/Library", root + "/.Trash"])) { path, name, st, _ in
+        FS.walk(root, skipping: FS.mountPoints().union([root + "/Library", root + "/.Trash"] + Privacy.unwalked())) { path, name, st, _ in
             if name == "node_modules" { return false }
             guard name == ".git" else { return true }
             let checkout = (path as NSString).deletingLastPathComponent

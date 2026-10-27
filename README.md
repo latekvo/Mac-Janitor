@@ -26,9 +26,12 @@ editor extensions, tool installs (mise, yarn and bun globals) and SDKs ship `nod
 no build makes again. Build output and large files are found in one walk of the visible home
 folder, skipping `~/Library`, the Trash and the cache folders.
 
-Reading the Trash takes Full Disk Access: add `MacJanitor.app` and
-`MacJanitor.app/Contents/MacOS/janitor` under System Settings > Privacy & Security > Full Disk
-Access. Without it the run reports an issue and leaves the Trash alone.
+No walk enters `~/Music` or `~/Pictures` (media libraries). The Trash, Desktop, Documents and
+Downloads take Full Disk Access: add `MacJanitor.app` and `MacJanitor.app/Contents/MacOS/janitor`
+under System Settings > Privacy & Security > Full Disk Access. Without it a run skips them and
+reports an issue; it never makes macOS ask. `build-app.sh` signs both with your Apple Development
+or Developer ID certificate (or `MACJANITOR_SIGN_IDENTITY`), so the grant survives rebuilds;
+signed ad hoc, every rebuild is a new app to macOS.
 
 Removing a big tree costs one metadata update per file, minutes for millions of them. A clean
 from the applet therefore plans only the targets it acts on, without measuring them again, renames each into

@@ -36,5 +36,18 @@ cat > "$APP/Contents/Info.plist" <<'PLIST'
 </plist>
 PLIST
 
+# macOS remembers privacy grants (Full Disk Access) by code identity. Ad-hoc code is
+# identified by its hash, which every rebuild changes, so grants would reset each time;
+# a certificate identity stays the same. MACJANITOR_SIGN_IDENTITY picks one, "-" is ad hoc.
+IDENTITY="${MACJANITOR_SIGN_IDENTITY:-$(security find-identity -v -p codesigning \
+  | awk -F'"' '/Developer ID Application|Apple Development/ { print $2; exit }')}"
+if [ -z "$IDENTITY" ] || [ "$IDENTITY" = "-" ]; then
+  echo "warning: signing ad hoc; macOS will forget Full Disk Access after every rebuild" >&2
+  IDENTITY="-"
+fi
+codesign --force --sign "$IDENTITY" --identifier com.ignacy.mac-janitor.janitor "$APP/Contents/MacOS/janitor"
+codesign --force --sign "$IDENTITY" "$APP"
+echo "Signed with: $IDENTITY"
+
 echo "Built $ROOT/$APP"
 echo "Launch:  open $ROOT/$APP"

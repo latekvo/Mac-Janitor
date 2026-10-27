@@ -67,3 +67,24 @@ public struct Guards {
         return nil
     }
 }
+
+/// Home folders no walk enters. macOS asks the user before a process reads Desktop,
+/// Documents or Downloads, unless it has Full Disk Access; a background job must not
+/// ask, so without it they are skipped. Music and Pictures hold media libraries,
+/// never checkouts, and reading them asks for media access.
+public enum Privacy {
+    /// Readable only with Full Disk Access, and checking asks nothing.
+    static let probe = Paths.home.appendingPathComponent("Library/Application Support/com.apple.TCC/TCC.db").path
+
+    public static var hasFullDiskAccess: Bool {
+        let fd = open(probe, O_RDONLY)
+        if fd >= 0 { close(fd) }
+        return fd >= 0
+    }
+
+    public static let askingFolders = ["Desktop", "Documents", "Downloads"].map { Paths.home.path + "/" + $0 }
+
+    public static func unwalked(fullDiskAccess: Bool = hasFullDiskAccess) -> [String] {
+        ["Music", "Pictures"].map { Paths.home.path + "/" + $0 } + (fullDiskAccess ? [] : askingFolders)
+    }
+}

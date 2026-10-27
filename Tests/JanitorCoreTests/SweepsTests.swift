@@ -204,6 +204,13 @@ final class SweepsTests: XCTestCase {
         XCTAssertEqual(flock(probe, LOCK_EX | LOCK_NB), 0)
     }
 
+    func testWalksLeaveAskingFoldersAloneWithoutFullDiskAccess() {
+        let home = Paths.home.path
+        XCTAssertEqual(Set(Privacy.unwalked(fullDiskAccess: false)),
+                       Set(["Music", "Pictures", "Desktop", "Documents", "Downloads"].map { home + "/" + $0 }))
+        XCTAssertEqual(Set(Privacy.unwalked(fullDiskAccess: true)), Set(["Music", "Pictures"].map { home + "/" + $0 }))
+    }
+
     func testOnlyPlansTheCategoriesItNames() throws {
         var cfg = Config()
         cfg.worktreeSearchRoot = root
