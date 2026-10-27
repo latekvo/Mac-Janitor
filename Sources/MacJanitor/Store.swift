@@ -40,6 +40,8 @@ final class Store: ObservableObject {
 
     /// The config `preview` was planned with.
     private var previewedWith: Config?
+    /// Identifies the latest preview; a clean bumps it to discard one in flight.
+    private var previewID = 0
     private let live: Bool
     private var panelOpen = false
     private var timer: Timer?
@@ -162,6 +164,12 @@ final class Store: ObservableObject {
             || !Set(then.keep).subtracting(config.keep).isEmpty
     }
 
+    /// A real run started after the preview did, so some of what it plans may be gone.
+    private var previewPredatesRun: Bool {
+        guard let preview, let lastRun else { return false }
+        return lastRun.startedAt > preview.startedAt
+    }
+
     /// When the next scheduled run is due, or nil when paused.
     var nextRun: Date? {
         guard !config.paused else { return nil }
@@ -190,7 +198,8 @@ final class Store: ObservableObject {
         guard busy == nil else { return }
         if Janitor.isRunning() {
             watchScheduledRun()
-        } else if !showSettings, previewIsStale || preview.map({ -$0.finishedAt.timeIntervalSinceNow > Self.previewMaxAge }) ?? true {
+        } else if !showSettings, previewIsStale || previewPredatesRun
+                    || preview.map({ -$0.finishedAt.timeIntervalSinceNow > Self.previewMaxAge }) ?? true {
             Task { await runPreview() }
         }
     }
@@ -214,24 +223,33 @@ final class Store: ObservableObject {
 
     func runPreview() async {
         guard live, busy == nil else { return }
+        if Janitor.isRunning() { return watchScheduledRun() }
         busy = .previewing
+        previewID += 1
+        let id = previewID
         let cfg = config
         let outcome = await JanitorRunner.run(dryRun: true)
+        // A clean started meanwhile; this plan predates it.
+        guard id == previewID else { return }
         busy = nil
         refresh()
-        if outcome.locked { return watchScheduledRun() }
+        if Janitor.isRunning() { return watchScheduledRun() }
         problem = outcome.problem
         if let report = outcome.report {
             preview = report
             previewedWith = cfg
-            // Settings changed while it ran.
-            if previewIsStale, panelOpen { await runPreview() }
+            // Settings changed, or a real run came and went, while it ran.
+            if previewIsStale || previewPredatesRun, panelOpen { await runPreview() }
         }
     }
 
+    /// Can run while a preview refreshes: the CLI acts only on ids it still plans.
+    var canClean: Bool { (busy == nil || busy == .previewing) && !planned.isEmpty }
+
     func clean() async {
         let ids = planned.map(\.id)
-        guard live, busy == nil, !ids.isEmpty else { return }
+        guard live, canClean else { return }
+        previewID += 1
         busy = .cleaning
         problem = nil
         let outcome = await JanitorRunner.run(dryRun: false, only: ids)

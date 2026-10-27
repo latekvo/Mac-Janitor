@@ -3,7 +3,7 @@ import Foundation
 public enum Janitor {
     static var lockPath: String { Paths.support.appendingPathComponent("run.lock").path }
 
-    /// True while some janitor process, scheduled or not, holds the run lock.
+    /// True while a real run, scheduled or not, holds the run lock.
     public static func isRunning() -> Bool {
         let fd = open(lockPath, O_RDONLY)
         guard fd >= 0 else { return false }
@@ -27,22 +27,14 @@ public enum Janitor {
 
     /// Plans every enabled rule and, unless `dryRun`, carries the plan out. With
     /// `only`, a real run acts on just those action ids, if they are still planned.
-    /// Holds an exclusive lock for the duration, so overlapping runs fail fast.
+    /// A real run holds an exclusive lock for the duration, so overlapping real runs
+    /// fail fast. A dry run takes none: it deletes nothing, and previews must neither
+    /// wait for nor block the scheduled run.
     public static func run(_ cfg: Config, dryRun: Bool, only: Set<String>? = nil,
                            log: (String) -> Void = { _ in }) throws -> Report {
         try FileManager.default.createDirectory(at: Paths.support, withIntermediateDirectories: true)
-        let lockFD = open(lockPath, O_CREAT | O_RDWR, 0o644)
-        // A few tries: `isRunning` probes hold the lock shared for an instant.
-        var locked = false
-        for _ in 0..<20 where lockFD >= 0 {
-            if flock(lockFD, LOCK_EX | LOCK_NB) == 0 { locked = true; break }
-            usleep(50_000)
-        }
-        guard locked else {
-            if lockFD >= 0 { close(lockFD) }
-            throw JanitorError("another janitor run is in progress")
-        }
-        defer { close(lockFD) }
+        let lockFD = dryRun ? nil : try lock()
+        defer { lockFD.map { _ = close($0) } }
 
         let started = Date()
         let freeBefore = freeDiskBytes()
@@ -98,6 +90,18 @@ public enum Janitor {
                             actions: actions, skips: skips, issues: issues)
         if !dryRun { try persist(report) }
         return report
+    }
+
+    /// The run lock, held exclusively until the descriptor is closed.
+    static func lock() throws -> Int32 {
+        let fd = open(lockPath, O_CREAT | O_RDWR, 0o644)
+        // A few tries: `isRunning` probes hold the lock shared for an instant.
+        for _ in 0..<20 where fd >= 0 {
+            if flock(fd, LOCK_EX | LOCK_NB) == 0 { return fd }
+            usleep(50_000)
+        }
+        if fd >= 0 { close(fd) }
+        throw JanitorError("another janitor run is in progress")
     }
 
     /// Salvaged work outlives its worktree by `abandonedIdleDays`, then goes too.
