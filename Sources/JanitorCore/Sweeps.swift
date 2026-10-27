@@ -108,8 +108,9 @@ struct HomeScan {
         ".build": ["Package.swift"],
     ]
 
-    /// Disk images belong to an emulator or VM, which an idle stretch does not retire.
-    static let diskImageExtensions: Set<String> = ["img", "qcow2", "raw", "ext4", "vmdk", "vdi", "vhdx", "iso"]
+    /// Disk images belong to an emulator or VM and packs to a git repo, which an idle
+    /// stretch does not retire.
+    static let partExtensions: Set<String> = ["img", "qcow2", "raw", "ext4", "vmdk", "vdi", "vhdx", "iso", "pack", "idx"]
 
     static func isArtifact(_ name: String, in dir: String) -> Bool {
         guard let markers = artifactMarkers[name] else { return false }
@@ -142,7 +143,7 @@ struct HomeScan {
                     stack.append((path, project, visible && !name.hasPrefix(".") && !package))
                 case S_IFREG:
                     if visible, let min = largeFileBytes, Int64(st.st_size) >= min,
-                       !diskImageExtensions.contains((name as NSString).pathExtension.lowercased()) {
+                       !partExtensions.contains((name as NSString).pathExtension.lowercased()) {
                         result.largeFiles.append(path)
                     }
                 default:

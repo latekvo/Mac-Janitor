@@ -90,7 +90,7 @@ final class SweepsTests: XCTestCase {
         XCTAssertEqual(plan.first?.reason, "idle untouched for 20 days")
     }
 
-    func testLargeFilesSkipHiddenFoldersAndDiskImages() throws {
+    func testLargeFilesSkipHiddenFoldersDiskImagesAndGitPacks() throws {
         func big(_ path: String) throws -> String {
             let p = try make(path, "")
             let h = try FileHandle(forWritingTo: URL(fileURLWithPath: p))
@@ -102,8 +102,9 @@ final class SweepsTests: XCTestCase {
         let fresh = try big("Movies/take2.mov")
         let hidden = try big(".ollama/blob")
         let image = try big("vm/disk.img")
+        let pack = try big("cache/repo/objects/pack/pack-1.pack")
         let small = try make("Movies/small.mov")
-        for p in [stale, hidden, image, small] { backdate(p, days: 90) }
+        for p in [stale, hidden, image, pack, small] { backdate(p, days: 90) }
         _ = fresh
 
         let scan = HomeScan.scan(root, skipping: [], largeFileBytes: 500_000_000)

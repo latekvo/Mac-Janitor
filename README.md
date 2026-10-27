@@ -18,7 +18,7 @@ the settings.
 | Build output: `node_modules`, `.next` (beside `package.json`), `Pods` (beside a `Podfile`), Gradle `build`, `.gradle` and `.cxx`, Xcode `build` (beside a project), Cargo `target`, SwiftPM `.build` | neither it nor its project (the nearest git checkout) changed for 14 days |
 | Cache entries: each entry in `~/Library/Caches`, Xcode DerivedData and DeviceSupport, CoreSimulator caches, the pnpm store, Gradle caches, `~/.cache`, `~/.npm/_npx`, pub, bun and yarn caches, the `/var/folders` cache folder | nothing in it written or read for 30 days; `com.apple.*` entries are left to macOS |
 | Items in the Trash | trashed over 7 days ago |
-| Stale large files (over 0.5 GB) in the home folder, outside hidden folders, `~/Library` and packages; disk images are left alone | untouched (not even read) for 60 days. Only removed when picked in the applet, and then moved to the Trash |
+| Stale large files (over 0.5 GB) in the home folder, outside hidden folders, `~/Library` and packages; disk images and git packs are left alone | untouched (not even read) for 60 days. Only removed when picked in the applet, and then moved to the Trash |
 
 Build output never includes worktree `node_modules`, or those of a repo with worktrees: the
 worktree rules own them. Build output and large files are found in one walk of the home folder,
