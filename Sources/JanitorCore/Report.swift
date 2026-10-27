@@ -6,6 +6,11 @@ public enum Category: String, Codable, CaseIterable, Sendable {
     case dockerImage = "docker-image"
     case avd
     case scratchpad
+    case build
+    case cache
+    case trash
+    /// Never removed by a run without `only`: the user picks them in the applet.
+    case largeFile = "large-file"
 }
 
 public struct Action: Codable, Sendable, Identifiable {

@@ -126,6 +126,8 @@ final class WorktreeJanitor {
     var skips: [Skip] = []
     /// Targets left in place this run, which their containers must not take with them.
     var stayed: [String] = []
+    /// The worktrees and plain copies `plan` looked at.
+    var scanned: [String] = []
     /// Never walked into or removed with a folder: a stalled one hangs, a live one holds data.
     let mounts = FS.mountPoints()
 
@@ -133,7 +135,8 @@ final class WorktreeJanitor {
         self.cfg = cfg
         self.guards = guards
         self.only = only
-        let found = cfg.enabled(.worktree) || cfg.enabled(.nodeModules)
+        // The build rule needs to know which node_modules are the worktree rules'.
+        let found = cfg.enabled(.worktree) || cfg.enabled(.nodeModules) || cfg.enabled(.build)
             ? Self.discover(under: cfg.worktreeSearchRoot) : Discovery()
         (repos, orphans, disconnected, checkouts) = (found.repos, found.orphans, found.disconnected, found.checkouts)
     }
@@ -451,6 +454,7 @@ final class WorktreeJanitor {
         // A worktree of one repo in another's `-worktrees` folder was found by both.
         let gitPaths = Set(checkouts.filter(\.facts.isGit).map(\.facts.path))
         checkouts.removeAll { !$0.facts.isGit && gitPaths.contains($0.facts.path) }
+        scanned = checkouts.map(\.facts.path)
         let orphaned = Set(orphans)
 
         var candidates: [Candidate] = []
@@ -625,8 +629,8 @@ final class WorktreeJanitor {
                 a.salvage = try salvage(a.target, head: head, repo: repo)
                 try Safety.check(a.target)
                 let record = Self.gitdir(of: a.target)
-                let r = git(["worktree", "remove", "--force", "--force", a.target], cwd: repo)
-                if !r.ok {
+                // git unlinks every file itself, which deferred removal is there to avoid.
+                if FS.deferRemoval || !git(["worktree", "remove", "--force", "--force", a.target], cwd: repo).ok {
                     try FS.remove(a.target)
                     // Not `git worktree prune`, which drops every lost record, moved worktrees' too.
                     if let record, Self.isWorktreeGitdir(record), FS.exists(record) { try FS.remove(record) }

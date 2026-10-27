@@ -10,6 +10,11 @@ public enum FS {
         Date(timeIntervalSince1970: TimeInterval(st.st_mtimespec.tv_sec))
     }
 
+    /// When the inode last changed, renames included.
+    static func ctime(_ st: stat) -> Date {
+        Date(timeIntervalSince1970: TimeInterval(st.st_ctimespec.tv_sec))
+    }
+
     public static func exists(_ path: String) -> Bool { lstatInfo(path) != nil }
 
     /// Symlink-free absolute spelling, so paths from git and from directory
@@ -74,6 +79,24 @@ public enum FS {
         return newest
     }
 
+    /// Like `newestMTime`, but a file read also counts. Directory access times are
+    /// ignored: listing one, as this walk does, sets them.
+    public static func lastUsed(_ root: String, newerThan cutoff: Date? = nil) -> Date? {
+        func used(_ st: stat) -> Date {
+            guard st.st_mode & S_IFMT != S_IFDIR else { return mtime(st) }
+            return max(mtime(st), Date(timeIntervalSince1970: TimeInterval(st.st_atimespec.tv_sec)))
+        }
+        guard let rootSt = lstatInfo(root) else { return nil }
+        var newest = used(rootSt)
+        if let cutoff, newest > cutoff { return newest }
+        walk(root) { _, _, st, stop in
+            newest = max(newest, used(st))
+            if let cutoff, newest > cutoff { stop = true }
+            return true
+        }
+        return newest
+    }
+
     /// Allocated bytes under `root`, counting each hard-linked inode once.
     /// Stops at mount points: another volume's bytes are not freed with `root`.
     public static func allocatedSize(_ root: String) -> Int64 {
@@ -112,15 +135,54 @@ public enum FS {
         return canonical((target as NSString).deletingLastPathComponent) + "/" + (target as NSString).lastPathComponent
     }
 
+    /// Removed paths wait here for `purge`. Unlinking a tree costs a metadata update per
+    /// file, minutes for a big one; renaming it here, on the same volume, is one.
+    static var purgeDir: String { Paths.support.appendingPathComponent("purge").path }
+
+    /// While set, `remove` renames into `purgeDir` and leaves the unlinking to `purge`.
+    public static var deferRemoval = false
+
     /// Removes a file, symlink (not its target) or directory tree.
     public static func remove(_ path: String) throws {
         try Safety.check(path)
+        if deferRemoval {
+            try? FileManager.default.createDirectory(atPath: purgeDir, withIntermediateDirectories: true)
+            // Fails across volumes, among others; then it is removed in place.
+            if rename(path, purgeDir + "/" + UUID().uuidString) == 0 { return }
+        }
         do {
             try FileManager.default.removeItem(atPath: path)
         } catch {
             // Read-only entries (some package caches) defeat removeItem; rm copes.
             let r = Shell.run(["/bin/rm", "-rf", "--", path], timeout: 1800)
             if !r.ok || exists(path) { throw JanitorError("could not remove \(path): \(r.stderr)") }
+        }
+    }
+}
+
+extension FS {
+    /// Unlinks what `remove` deferred. Detached, it outlives this process and leaves
+    /// its stdio alone, so a caller reading this process's output is not held up.
+    public static func purge(detached: Bool) {
+        let entries = ((try? FileManager.default.contentsOfDirectory(atPath: purgeDir)) ?? []).map { purgeDir + "/" + $0 }
+        guard !entries.isEmpty else { return }
+        guard detached else {
+            Shell.run(["/bin/rm", "-rf", "--"] + entries, timeout: 3600)
+            return
+        }
+        var attr: posix_spawnattr_t?
+        posix_spawnattr_init(&attr)
+        defer { posix_spawnattr_destroy(&attr) }
+        posix_spawnattr_setflags(&attr, Int16(POSIX_SPAWN_SETSID))
+        var files: posix_spawn_file_actions_t?
+        posix_spawn_file_actions_init(&files)
+        defer { posix_spawn_file_actions_destroy(&files) }
+        for fd: Int32 in 0...2 { posix_spawn_file_actions_addopen(&files, fd, "/dev/null", O_RDWR, 0) }
+        let argv = (["/bin/rm", "-rf", "--"] + entries).map { strdup($0) } + [nil]
+        defer { argv.forEach { free($0) } }
+        var pid = pid_t()
+        if posix_spawn(&pid, "/bin/rm", &files, &attr, argv, environ) != 0 {
+            Shell.run(["/bin/rm", "-rf", "--"] + entries, timeout: 3600)
         }
     }
 }

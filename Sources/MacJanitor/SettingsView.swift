@@ -46,6 +46,16 @@ struct SettingsView: View {
                            value: store.binding(\.avdUnusedDays))
                 StepperRow(symbol: JanitorCore.Category.scratchpad.symbol, label: "Scratchpad idle",
                            value: store.binding(\.scratchpadIdleDays))
+                StepperRow(symbol: JanitorCore.Category.build.symbol, label: "Project idle",
+                           value: store.binding(\.buildIdleDays))
+                StepperRow(symbol: JanitorCore.Category.cache.symbol, label: "Cache unused",
+                           value: store.binding(\.cacheIdleDays))
+                StepperRow(symbol: JanitorCore.Category.trash.symbol, label: "In the Trash",
+                           value: store.binding(\.trashIdleDays))
+                StepperRow(symbol: JanitorCore.Category.largeFile.symbol, label: "Large file untouched",
+                           value: store.binding(\.largeFileIdleDays))
+                StepperRow(symbol: JanitorCore.Category.largeFile.symbol, label: "Large file over",
+                           value: store.binding(\.largeFileMinGB), range: 0.5...100, step: 0.5, unit: " GB")
             }
 
             if !store.config.keep.isEmpty {

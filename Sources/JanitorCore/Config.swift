@@ -23,9 +23,20 @@ public struct Config: Codable, Equatable, Sendable {
     public var dockerImageUnusedDays = 7.0
     public var avdUnusedDays = 7.0
     public var scratchpadIdleDays = 14.0
+    /// Build output goes once neither it nor its project changed for this long.
+    public var buildIdleDays = 14.0
+    /// A cache entry goes once nothing in it was written or read for this long.
+    public var cacheIdleDays = 30.0
+    public var trashIdleDays = 7.0
+    public var largeFileIdleDays = 60.0
+    public var largeFileMinGB = 0.5
 
     public var scratchpadRoot = "/private/tmp/claude-\(getuid())"
     public var avdHome = Paths.home.appendingPathComponent(".android/avd").path
+    public var androidSDK = Paths.home.appendingPathComponent("Library/Android/sdk").path
+    public var trashDir = Paths.home.appendingPathComponent(".Trash").path
+    /// Each entry directly inside one of these is a cache entry.
+    public var cacheRoots = CacheJanitor.defaultRoots
     /// Where uncommitted work from removed worktrees is kept.
     public var salvageDir = Paths.salvage.path
 

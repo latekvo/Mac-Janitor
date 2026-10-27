@@ -102,7 +102,42 @@ enum AVDJanitor {
             actions.append(Action(category: .avd, target: name, reason: reason,
                                   bytes: FS.allocatedSize(dir), status: .planned))
         }
-        return actions
+        return actions + planImages(cfg, guards: guards, now: now, skips: &skips)
+    }
+
+    /// The SDK's `system-images/<api>/<tag>/<abi>` folders, which emulators boot from.
+    static func systemImages(sdk: String) -> [String] {
+        func dirs(_ path: String) -> [String] {
+            ((try? FileManager.default.contentsOfDirectory(atPath: path)) ?? []).sorted()
+                .map { path + "/" + $0 }.filter(FS.isDirectory)
+        }
+        return dirs(sdk + "/system-images").flatMap(dirs).flatMap(dirs)
+    }
+
+    /// A system image no AVD names in its `image.sysdir.1`, and no emulator read for
+    /// `avdUnusedDays`; `sdkmanager` downloads it again.
+    static func planImages(_ cfg: Config, guards: Guards, now: Date, skips: inout [Skip]) -> [Action] {
+        let sdk = FS.canonical(cfg.androidSDK)
+        var used = Set<String>()
+        for ini in (try? FileManager.default.contentsOfDirectory(atPath: cfg.avdHome)) ?? [] where ini.hasSuffix(".ini") {
+            let config = avdDirectory(home: cfg.avdHome, name: String(ini.dropLast(4))) + "/config.ini"
+            for line in ((try? String(contentsOfFile: config, encoding: .utf8)) ?? "").split(separator: "\n")
+            where line.hasPrefix("image.sysdir.") {
+                let value = line.split(separator: "=", maxSplits: 1).last.map { $0.trimmingCharacters(in: .whitespaces) } ?? ""
+                used.insert(FS.normalize(sdk + "/" + value))
+            }
+        }
+        let cutoff = now.addingTimeInterval(-cfg.avdUnusedDays * 86400)
+        return systemImages(sdk: sdk).compactMap { image -> Action? in
+            guard !used.contains(image), let last = FS.lastUsed(image, newerThan: cutoff), last <= cutoff else { return nil }
+            return planPath(.avd, image, reason: "no emulator uses it; unused for \(days(last, now)) days",
+                            cfg: cfg, guards: guards, skips: &skips)
+        }
+    }
+
+    /// What an AVD action removes: an AVD by name, or a system image by path.
+    static func directory(of a: Action, _ cfg: Config) -> String {
+        a.target.hasPrefix("/") ? a.target : avdDirectory(home: cfg.avdHome, name: a.target)
     }
 
     /// The `.ini` names the AVD's directory; it defaults to `<name>.avd` beside it.
@@ -115,6 +150,13 @@ enum AVDJanitor {
     }
 
     static func execute(_ a: Action, _ cfg: Config) -> Action {
+        if a.target.hasPrefix("/") {
+            let done = removePath(a)
+            // The emptied <tag> and <api> folders; rmdir refuses non-empty ones.
+            let tag = (a.target as NSString).deletingLastPathComponent
+            if rmdir(tag) == 0 { rmdir((tag as NSString).deletingLastPathComponent) }
+            return done
+        }
         var a = a
         do {
             try FS.remove(avdDirectory(home: cfg.avdHome, name: a.target))
@@ -142,35 +184,18 @@ enum ScratchpadJanitor {
                 guard FS.isDirectory(sdir) else { continue }
                 let newest = FS.newestMTime(sdir, newerThan: cutoff) ?? .distantPast
                 guard newest <= cutoff else { continue }
-                let reason = "untouched for \(Int(now.timeIntervalSince(newest) / 86400)) days"
-                if cfg.isKept(sdir) {
-                    skips.append(Skip(category: .scratchpad, target: sdir, reason: "kept", kept: true,
-                                      bytes: FS.allocatedSize(sdir)))
-                    continue
-                }
-                if let veto = guards.veto(sdir) {
-                    skips.append(Skip(category: .scratchpad, target: sdir, reason: "\(reason), but \(veto)"))
-                    continue
-                }
-                actions.append(Action(category: .scratchpad, target: sdir, reason: reason,
-                                      bytes: FS.allocatedSize(sdir), status: .planned))
+                if let a = planPath(.scratchpad, sdir, reason: "untouched for \(days(newest, now)) days",
+                                    cfg: cfg, guards: guards, skips: &skips) { actions.append(a) }
             }
         }
         return actions
     }
 
     static func execute(_ a: Action) -> Action {
-        var a = a
-        do {
-            try FS.remove(a.target)
-            a.status = .removed
-            // Drop the project folder once its last session is gone; rmdir refuses a non-empty one.
-            rmdir((a.target as NSString).deletingLastPathComponent)
-        } catch {
-            a.status = .failed
-            a.error = "\(error)"
-        }
-        return a
+        let done = removePath(a)
+        // Drop the project folder once its last session is gone; rmdir refuses a non-empty one.
+        if done.status == .removed { rmdir((a.target as NSString).deletingLastPathComponent) }
+        return done
     }
 }
 

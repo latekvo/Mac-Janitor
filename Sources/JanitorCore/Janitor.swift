@@ -32,9 +32,16 @@ public enum Janitor {
     /// wait for nor block the scheduled run.
     public static func run(_ cfg: Config, dryRun: Bool, only: Set<String>? = nil,
                            log: (String) -> Void = { _ in }) throws -> Report {
+        var cfg = cfg
+        // Planning a category takes up to minutes (fetch, gh, walks); skip those `only` cannot name.
+        if let only {
+            cfg.disabled += Category.allCases.filter { c in !only.contains { $0.hasPrefix(c.rawValue + ":") } }
+        }
         try FileManager.default.createDirectory(at: Paths.support, withIntermediateDirectories: true)
         let lockFD = dryRun ? nil : try lock()
         defer { lockFD.map { _ = close($0) } }
+        // A clean from the applet returns once targets are out of the way, not unlinked.
+        FS.deferRemoval = !dryRun && only != nil
 
         let started = Date()
         let freeBefore = freeDiskBytes()
@@ -43,7 +50,8 @@ public enum Janitor {
         var issues: [Issue] = []
 
         let wt = WorktreeJanitor(cfg: cfg, guards: guards, only: only)
-        Safety.protectedPaths = (wt.repos + wt.repos.map(WorktreeJanitor.root) + [cfg.avdHome, cfg.scratchpadRoot])
+        Safety.protectedPaths = (wt.repos + wt.repos.map(WorktreeJanitor.root)
+            + [cfg.avdHome, cfg.scratchpadRoot, cfg.trashDir, cfg.androidSDK + "/system-images"] + cfg.cacheRoots)
             .map(FS.canonical)
         let worktrees = wt.plan()
         skips += wt.skips
@@ -52,8 +60,28 @@ public enum Janitor {
         let avds = cfg.enabled(.avd) ? AVDJanitor.plan(cfg, guards: guards, now: started, skips: &skips) : []
         let images = cfg.enabled(.dockerImage) ? DockerJanitor.plan(cfg, now: started, skips: &skips, issues: &issues) : []
 
+        let searchRoot = FS.canonical(FS.normalize(cfg.worktreeSearchRoot))
+        let scan = cfg.enabled(.build) || cfg.enabled(.largeFile)
+            ? HomeScan.scan(searchRoot, skipping: Set([searchRoot + "/Library", FS.canonical(cfg.trashDir)] + cfg.cacheRoots.map(FS.canonical)),
+                            largeFileBytes: cfg.enabled(.largeFile) ? Int64(cfg.largeFileMinGB * 1e9) : nil)
+            : HomeScan()
+        // Worktrees and their node_modules are the worktree rules' to judge, and a
+        // worktree's node_modules may link into its repo's.
+        let worktreeTargets = worktrees.map(\.action.target)
+        let nodeModulesOwners = wt.repos + wt.repos.map(WorktreeJanitor.root) + wt.scanned
+        func under(_ path: String, _ dirs: [String]) -> Bool { dirs.contains { path == $0 || path.hasPrefix($0 + "/") } }
+        let builds = cfg.enabled(.build) ? BuildJanitor.plan(cfg, guards: guards, now: started, scan: scan, owner: { path in
+            if under(path, worktreeTargets) { return "worktree" }
+            if (path as NSString).lastPathComponent == "node_modules", under(path, nodeModulesOwners) { return "node_modules" }
+            return nil
+        }, skips: &skips) : []
+        let caches = cfg.enabled(.cache) ? CacheJanitor.plan(cfg, guards: guards, now: started, skips: &skips) : []
+        let trash = cfg.enabled(.trash) ? TrashJanitor.plan(cfg, guards: guards, now: started, skips: &skips, issues: &issues) : []
+        let large = cfg.enabled(.largeFile) ? LargeFileJanitor.plan(cfg, guards: guards, now: started, scan: scan, skips: &skips) : []
+
         var actions: [Action] = []
-        func wanted(_ a: Action) -> Bool { only?.contains(a.id) ?? true }
+        // Large files are previewed, but only ever removed by name.
+        func wanted(_ a: Action) -> Bool { only?.contains(a.id) ?? (dryRun || a.category != .largeFile) }
         func record(_ a: Action) {
             actions.append(a)
             let size = ByteCountFormatter.string(fromByteCount: a.bytes, countStyle: .file)
@@ -77,18 +105,23 @@ public enum Janitor {
             record(dryRun ? c.action : wt.execute(c))
         }
         for a in scratch where wanted(a) && stillFree(a, a.target) { record(dryRun ? a : ScratchpadJanitor.execute(a)) }
-        for a in avds where wanted(a) && stillFree(a, AVDJanitor.avdDirectory(home: cfg.avdHome, name: a.target)) {
+        for a in avds where wanted(a) && stillFree(a, AVDJanitor.directory(of: a, cfg)) {
             record(dryRun ? a : AVDJanitor.execute(a, cfg))
         }
         for a in images where wanted(a) { record(dryRun ? a : DockerJanitor.execute(a)) }
+        for a in builds + caches + trash where wanted(a) && stillFree(a, a.target) { record(dryRun ? a : removePath(a)) }
+        for a in large where wanted(a) && stillFree(a, a.target) { record(dryRun ? a : LargeFileJanitor.execute(a)) }
         if !dryRun && only == nil { pruneSalvage(cfg, now: started, log: log) }
         for s in skips { log("skip \(s.category.rawValue) \(s.target): \(s.reason)") }
         for i in issues { log("issue \(i.category.rawValue): \(i.message)") }
 
+        // Nobody waits on a scheduled run, so it frees the space before measuring it.
+        if !dryRun && !FS.deferRemoval { FS.purge(detached: false) }
         let report = Report(startedAt: started, finishedAt: Date(), dryRun: dryRun,
                             freeBytesBefore: freeBefore, freeBytesAfter: freeDiskBytes(),
                             actions: actions, skips: skips, issues: issues)
         if !dryRun { try persist(report) }
+        if !dryRun && FS.deferRemoval { FS.purge(detached: true) }
         return report
     }
 

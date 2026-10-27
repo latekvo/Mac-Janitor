@@ -51,7 +51,8 @@ enum Format {
     }
 
     /// A node_modules by its worktree, a scratchpad by project and session, an image by
-    /// its first tag without registry, anything else by its last path component.
+    /// its first tag without registry, build output and cache entries by what holds them,
+    /// a system image by API and tag, anything else by its last path component.
     static func name(_ target: String, _ category: JanitorCore.Category) -> String {
         let parts = target.split(separator: "/").map(String.init)
         switch category {
@@ -65,6 +66,11 @@ enum Format {
             guard parts.count >= 2 else { return target }
             let project = parts[parts.count - 2].split(separator: "-").last.map(String.init) ?? ""
             return "\(project) · \(parts[parts.count - 1].prefix(8))"
+        case .build, .cache:
+            return parts.suffix(category == .build ? 3 : 2).joined(separator: "/")
+        case .avd where target.hasPrefix("/"):
+            // ".../system-images/<api>/<tag>/<abi>"
+            return parts.suffix(3).dropLast().joined(separator: " ")
         case .dockerImage:
             let parts = target.components(separatedBy: " (")
             let tags = parts[0]
@@ -85,6 +91,10 @@ extension JanitorCore.Category {
         case .dockerImage: return "Docker"
         case .avd: return "Emulators"
         case .scratchpad: return "Scratchpads"
+        case .build: return "Build output"
+        case .cache: return "Caches"
+        case .trash: return "Trash"
+        case .largeFile: return "Stale large files"
         }
     }
 
@@ -95,6 +105,10 @@ extension JanitorCore.Category {
         case .dockerImage: return "square.stack.3d.up"
         case .avd: return "iphone"
         case .scratchpad: return "note.text"
+        case .build: return "hammer"
+        case .cache: return "archivebox"
+        case .trash: return "trash"
+        case .largeFile: return "zzz"
         }
     }
 }

@@ -1,6 +1,6 @@
 # Mac Janitor
 
-Keeps the disk from filling up with agent leftovers. One LaunchAgent wakes the
+Keeps the disk from filling up with agent leftovers, build output, caches and the Trash. One LaunchAgent wakes the
 `janitor` CLI hourly; it runs every 6 hours, or at once when free space drops
 below 20 GB. A menu-bar applet previews what would go, cleans on demand and holds
 the settings.
@@ -14,6 +14,20 @@ the settings.
 | Docker images | no container uses them and they arrived locally over 7 days ago |
 | Android emulators (AVDs) | unused for 7 days |
 | Claude Code scratchpads (`/private/tmp/claude-<uid>/<project>/<session>`) | untouched for 14 days |
+| Android system images | no AVD uses them and no emulator read them for 7 days |
+| Build output: `node_modules`, `.next` (beside `package.json`), `Pods` (beside a `Podfile`), Gradle `build`, `.gradle` and `.cxx`, Xcode `build` (beside a project), Cargo `target`, SwiftPM `.build` | neither it nor its project (the nearest git checkout) changed for 14 days |
+| Cache entries: each entry in `~/Library/Caches`, Xcode DerivedData and DeviceSupport, CoreSimulator caches, the pnpm store, Gradle caches, `~/.cache`, `~/.npm/_npx`, pub, bun and yarn caches, the `/var/folders` cache folder | nothing in it written or read for 30 days; `com.apple.*` entries are left to macOS |
+| Items in the Trash | trashed over 7 days ago |
+| Stale large files (over 0.5 GB) in the home folder, outside hidden folders, `~/Library` and packages; disk images are left alone | untouched (not even read) for 60 days. Only removed when picked in the applet, and then moved to the Trash |
+
+Build output never includes worktree `node_modules`, or those of a repo with worktrees: the
+worktree rules own them. Build output and large files are found in one walk of the home folder,
+skipping `~/Library`, the Trash and the cache folders.
+
+Removing a big tree costs one metadata update per file, minutes for millions of them. A clean
+from the applet therefore plans only the categories it acts on, renames each target into
+`~/Library/Application Support/MacJanitor/purge` and returns; a detached `rm` frees the space
+afterwards. Scheduled runs empty that folder themselves, so their report shows what they freed.
 
 Worktrees are found by walking the home folder, skipping mounted volumes, `~/Library`,
 the Trash and `node_modules`: those registered with any repo there, plus plain copies in
